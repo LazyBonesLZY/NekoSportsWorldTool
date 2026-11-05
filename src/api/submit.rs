@@ -7,8 +7,10 @@ use crate::crypto::decrypt::{decrypt_response, derive_paes_key};
 use crate::crypto::envelope::{
     build_envelope, build_envelope_ts, rsa_public_key, OuterOrder,
 };
-use crate::crypto::header::{build_android_header, HeaderIdentity, UA_ANDROID};
-use crate::crypto::sign::{original_sign, signature};
+use crate::crypto::header::{
+    build_android_header, build_native_ios_header, ua_ios_for, HeaderIdentity, UA_ANDROID,
+};
+use crate::crypto::sign::{original_sign, original_sign_ios, signature, signature_ios};
 use crate::track::calorie::{avg_power, official_kcal};
 use crate::track::geom::round_to;
 use crate::track::model::{GenPoint, Track};
@@ -127,56 +129,104 @@ pub fn submit_record(client: &mut ApiClient, p: &SubmitParams, log: &mut dyn FnM
     let avg_step_freq = 1i64.max(round_to(total_steps as f64 / total_time as f64 * 60.0, 0) as i64);
 
     let mut body = Map::new();
-    body.insert("allLocJson".into(), Value::String(String::new()));
-    body.insert("sportType".into(), Value::from(1));
-    body.insert("policy".into(), Value::from(p.policy));
-    body.insert("totalTime".into(), Value::from(total_time));
-    body.insert("startTime".into(), Value::from(start_ms));
-    body.insert("stopTime".into(), Value::from(stop_ms));
-    body.insert("getPrize".into(), Value::Bool(false));
-    body.insert("status".into(), Value::from(0));
-    body.insert("uuid".into(), Value::String(run_uuid.clone()));
-    body.insert("uid".into(), Value::from(p.uid));
-    body.insert("selectedUnid".into(), Value::from(unid));
-    body.insert("selRunTime".into(), Value::from(total_time));
-    body.insert("selDistance".into(), Value::from(p.min_distance));
-    body.insert("totalDis".into(), Value::from(round_to(total_dis, 0) as i64));
-    body.insert("speed".into(), Value::from(speed));
-    body.insert("validDis".into(), Value::from(round_to(total_dis, 0) as i64));
-    body.insert("validTime".into(), Value::from(total_time));
-    body.insert("complete".into(), Value::Bool(true));
-    body.insert("unCompleteReason".into(), Value::from(0));
-    body.insert("calorie".into(), Value::from(kcal));
-    body.insert("totalSteps".into(), Value::from(total_steps));
-    body.insert("avgStepFreq".into(), Value::from(avg_step_freq));
-    body.insert("useMobilityTools".into(), Value::from(0));
-    body.insert("faceCheck".into(), Value::from(p.face_check));
-    body.insert("totalAscent".into(), Value::from(round_to(ascent, 0) as i64));
-    body.insert("avgPower".into(), Value::from(power));
-    body.insert("speedPerTenSec".into(), Value::Array(android_tensec(track, start_ms, "speed")));
-    body.insert("stepsPerTenSec".into(), Value::Array(android_tensec(track, start_ms, "steps")));
-    body.insert("isUpload".into(), Value::Bool(false));
-    body.insert("more".into(), Value::Bool(false));
-    body.insert("latitude".into(), Value::from(start_coordinate.latitude));
-    body.insert("longitude".into(), Value::from(start_coordinate.longitude));
-    body.insert("maxRunTime".into(), Value::from(0));
-    body.insert("minSteps".into(), Value::from(0));
-    if !p.five_point_json.is_empty() {
+    // 提交身份形态：ios（默认，7.4.0 实机 29 键 body + iOS 签名）| android（历史实测兼容形态）
+    let ios_form = crate::api::model::load_config().submit_form.eq_ignore_ascii_case("ios");
+    if ios_form {
+        // iOS 7.4.0 buildGrade 键序（保持插入序对齐实机）。
+        // 值类型：getPrize/unauthorized/complete 为字符串；goalId 为数字；address 为城市或空串。
         body.insert("fivePointJson".into(), Value::String(p.five_point_json.clone()));
+        body.insert("allLocJson".into(), Value::String(String::new()));
+        body.insert("sportType".into(), Value::from(1));
+        body.insert("policy".into(), Value::from(p.policy));
+        body.insert("totalTime".into(), Value::from(total_time));
+        body.insert("startTime".into(), Value::from(start_ms));
+        body.insert("stopTime".into(), Value::from(stop_ms));
+        body.insert("getPrize".into(), Value::String("false".into()));
+        body.insert("status".into(), Value::from(0));
+        body.insert("uuid".into(), Value::String(run_uuid.clone()));
+        body.insert("uid".into(), Value::from(p.uid));
+        body.insert("unauthorized".into(), Value::String("0".into()));
+        body.insert("themeId".into(), Value::from(0));
+        body.insert("selectedUnid".into(), Value::from(unid));
+        body.insert("selRunTime".into(), Value::from(total_time));
+        body.insert("selDistance".into(), Value::from(p.min_distance));
+        body.insert("totalDis".into(), Value::from(round_to(total_dis, 0) as i64));
+        body.insert("speed".into(), Value::from(speed));
+        body.insert("validDis".into(), Value::from(round_to(total_dis, 0) as i64));
+        body.insert("validTime".into(), Value::from(total_time));
+        body.insert("complete".into(), Value::String("true".into()));
+        body.insert("unCompleteReason".into(), Value::from(0));
+        body.insert("calorie".into(), Value::from(kcal));
+        body.insert("address".into(), Value::String(p.address.trim().to_string()));
+        body.insert("goalId".into(), Value::from(0));
+        body.insert("totalAscent".into(), Value::from(round_to(ascent, 0) as i64));
+        body.insert("avgPower".into(), Value::from(power));
+        body.insert("totalSteps".into(), Value::from(total_steps));
+        body.insert("avgStepFreq".into(), Value::from(avg_step_freq));
+        body.insert("useMobilityTools".into(), Value::from(0));
+        body.insert("faceCheck".into(), Value::from(p.face_check));
+        // iOS 签名：全部键 − 排除集（allLocJson/fivePointJson 等 7 键），大小写敏感排序
+        let body_val = Value::Object(body.clone());
+        let sig = signature_ios(&body_val);
+        let orig = original_sign_ios(&body_val);
+        body.insert("signature".into(), Value::String(sig));
+        body.insert("originalSign".into(), Value::String(orig));
+        // 签名后插入：10s 窗数组恒空（真实数据走 OBS speed_json/step_freq_json）
+        body.insert("segmentJson".into(), Value::String(String::new()));
+        body.insert("speedPerTenSec".into(), Value::Array(Vec::new()));
+        body.insert("stepsPerTenSec".into(), Value::Array(Vec::new()));
+    } else {
+        // Android 兼容形态：31+ 字段超集 + UploadSignEntity 白名单签名（历史实测通过）
+        body.insert("allLocJson".into(), Value::String(String::new()));
+        body.insert("sportType".into(), Value::from(1));
+        body.insert("policy".into(), Value::from(p.policy));
+        body.insert("totalTime".into(), Value::from(total_time));
+        body.insert("startTime".into(), Value::from(start_ms));
+        body.insert("stopTime".into(), Value::from(stop_ms));
+        body.insert("getPrize".into(), Value::Bool(false));
+        body.insert("status".into(), Value::from(0));
+        body.insert("uuid".into(), Value::String(run_uuid.clone()));
+        body.insert("uid".into(), Value::from(p.uid));
+        body.insert("selectedUnid".into(), Value::from(unid));
+        body.insert("selRunTime".into(), Value::from(total_time));
+        body.insert("selDistance".into(), Value::from(p.min_distance));
+        body.insert("totalDis".into(), Value::from(round_to(total_dis, 0) as i64));
+        body.insert("speed".into(), Value::from(speed));
+        body.insert("validDis".into(), Value::from(round_to(total_dis, 0) as i64));
+        body.insert("validTime".into(), Value::from(total_time));
+        body.insert("complete".into(), Value::Bool(true));
+        body.insert("unCompleteReason".into(), Value::from(0));
+        body.insert("calorie".into(), Value::from(kcal));
+        body.insert("totalSteps".into(), Value::from(total_steps));
+        body.insert("avgStepFreq".into(), Value::from(avg_step_freq));
+        body.insert("useMobilityTools".into(), Value::from(0));
+        body.insert("faceCheck".into(), Value::from(p.face_check));
+        body.insert("totalAscent".into(), Value::from(round_to(ascent, 0) as i64));
+        body.insert("avgPower".into(), Value::from(power));
+        body.insert("speedPerTenSec".into(), Value::Array(android_tensec(track, start_ms, "speed")));
+        body.insert("stepsPerTenSec".into(), Value::Array(android_tensec(track, start_ms, "steps")));
+        body.insert("isUpload".into(), Value::Bool(false));
+        body.insert("more".into(), Value::Bool(false));
+        body.insert("latitude".into(), Value::from(start_coordinate.latitude));
+        body.insert("longitude".into(), Value::from(start_coordinate.longitude));
+        body.insert("maxRunTime".into(), Value::from(0));
+        body.insert("minSteps".into(), Value::from(0));
+        if !p.five_point_json.is_empty() {
+            body.insert("fivePointJson".into(), Value::String(p.five_point_json.clone()));
+        }
+        // Android 必现扩展字段
+        body.insert("errorCode".into(), Value::from(0));
+        body.insert("geeToken".into(), Value::String(String::new()));
+        body.insert("unauthorized".into(), Value::from(0));
+        body.insert("themeId".into(), Value::from(0));
+        body.insert("goalId".into(), Value::Null);
+        body.insert("address".into(), Value::String(p.address.trim().to_string()));
+        let body_val = Value::Object(body.clone());
+        let sig = signature(&body_val, false);
+        let orig = original_sign(&body_val, false);
+        body.insert("signature".into(), Value::String(sig));
+        body.insert("originalSign".into(), Value::String(orig));
     }
-    // Android 必现扩展字段
-    body.insert("errorCode".into(), Value::from(0));
-    body.insert("geeToken".into(), Value::String(String::new()));
-    body.insert("unauthorized".into(), Value::from(0));
-    body.insert("themeId".into(), Value::from(0));
-    body.insert("goalId".into(), Value::Null);
-    body.insert("address".into(), Value::String(p.address.trim().to_string()));
-
-    let body_val = Value::Object(body.clone());
-    let sig = signature(&body_val, false);
-    let orig = original_sign(&body_val, false);
-    body.insert("signature".into(), Value::String(sig));
-    body.insert("originalSign".into(), Value::String(orig));
     let body_plain = Value::Object(body).to_string();
 
     let device_id = if client.identity.device_id.is_empty() {
@@ -184,25 +234,38 @@ pub fn submit_record(client: &mut ApiClient, p: &SubmitParams, log: &mut dyn FnM
     } else {
         client.identity.device_id.clone()
     };
-    let android_identity = HeaderIdentity {
-        platform: "android".into(),
-        device_id: device_id.clone(),
-        os_version: "14".into(),
-        device_name: "22081212C".into(),
-        ..client.identity.clone()
+    let (hp, hp_extra, ua, app_ver): (String, Vec<(String, String)>, String, &'static str) = if ios_form {
+        // iOS 形态：直接复用全链设备身份（平台/机型/系统版本与 policy/points/OBS 完全一致）
+        let (hp, extra) = build_native_ios_header(&client.identity, p.uid, &client_token(client), None);
+        (hp, extra, ua_ios_for(&client.identity.os_version), crate::crypto::header::IOS_APP_VERSION)
+    } else {
+        let android_identity = HeaderIdentity {
+            platform: "android".into(),
+            device_id: device_id.clone(),
+            os_version: "14".into(),
+            device_name: "22081212C".into(),
+            ..client.identity.clone()
+        };
+        let (hp, extra) = build_android_header(&android_identity, p.uid, &client_token(client), None);
+        (hp, extra, UA_ANDROID.to_string(), crate::crypto::header::ANDROID_APP_VERSION)
     };
-    let (hp, hp_extra) = build_android_header(&android_identity, p.uid, &client_token(client), None);
     let header_env = build_envelope(&mut client.session, &hp, OuterOrder::Observed);
-    let now = crate::crypto::envelope::now_ms();
-    let body_env = build_envelope_ts(&mut client.session, &body_plain, OuterOrder::Insert, now + 1);
+    // body 时间戳 = header ts + 0..=2ms（与 client.rs 一致：原生两次独立取时的自然抖动）
+    let delta = (rand::Rng::gen::<u32>(&mut rand::thread_rng()) % 3) as i64;
+    let body_env =
+        build_envelope_ts(&mut client.session, &body_plain, OuterOrder::Insert, header_env.ts_ms + delta);
 
-    let runes = format!("{}{}", p.policy_ts, p.uid);
+    // runes = uid + policy 时间戳；runef = 记录 UUID + startTime（recordID）
+    let runes = format!("{}{}", p.uid, p.policy_ts);
     let runef = format!("{}{}", run_uuid, start_ms);
     let mut req = client.agent.post(&format!("{HOST}{RECORD_PATH}"));
     req = req
         .set("Content-Type", "application/json; charset=utf-8")
-        .set("User-Agent", UA_ANDROID)
-        .set("appVersion", "7.3.40")
+        .set("Accept", "*/*")
+        .set("Accept-Language", "zh-Hans-CN;q=1.0")
+        .set("Accept-Encoding", "gzip;q=1.0, compress;q=0.5")
+        .set("User-Agent", &ua)
+        .set("appVersion", app_ver)
         .set("headerSign", &header_env.json)
         .set("runes", &runes)
         .set("runef", &runef);

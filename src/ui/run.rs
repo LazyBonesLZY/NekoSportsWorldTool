@@ -79,6 +79,8 @@ pub struct RunPage {
     pub plan: Option<RunPlan>,
     /// 路线算法模式
     pub route_mode: RouteMode,
+    /// 提交身份形态：true=ios（与全链同身份，消除机型跳变指纹）
+    pub submit_ios: bool,
     /// 地图视图状态
     pub map: MapState,
     /// 路网预览（真实道路路由）
@@ -396,6 +398,14 @@ impl App {
                 ui.selectable_value(&mut page.route_mode, RouteMode::Road, "真实道路路由");
                 if page.route_mode == RouteMode::Road && self.network.is_none() {
                     ui.colored_label(theme::warn(), "（需先在「路网」页导入 OSM）");
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("提交身份：");
+                ui.selectable_value(&mut page.submit_ios, true, "iOS（默认，实机语义）");
+                ui.selectable_value(&mut page.submit_ios, false, "Android（兼容兜底）");
+                if !page.submit_ios {
+                    ui.colored_label(theme::warn(), "兼容形态：若 iOS 形态被拒再切回");
                 }
             });
         }
@@ -719,6 +729,7 @@ impl App {
         } else {
             "legacy".into()
         };
+        self.config.submit_form = if self.run_page.submit_ios { "ios".into() } else { "android".into() };
         let _ = crate::api::model::save_config(&self.config);
 
         let identity = self.identity.clone();

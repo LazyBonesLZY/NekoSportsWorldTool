@@ -8,7 +8,14 @@ use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
 
 pub const MET_PER_DEG_LAT: f64 = 111_132.0;
+/// 默认经度米/度（大连纬度 38.9°，向后兼容旧测试）；新代码用 [`m_per_deg_lng`]。
 pub const MET_PER_DEG_LNG: f64 = 86_600.0;
+
+/// 纬度相关的经度米/度：111320 × cos(lat)。江门(22.4°)≈102913，大连(38.9°)≈86600。
+#[inline]
+pub fn m_per_deg_lng(lat: f64) -> f64 {
+    111_320.0 * lat.to_radians().cos()
+}
 
 /// round(x, n)：按精确二进制值四舍五入。
 pub fn round_to(x: f64, n: usize) -> f64 {
@@ -63,6 +70,125 @@ impl Rng {
 
 /// 打卡点 BD 系 (lat, lng) → 闭合平面路径 + 弧长表 + 中心。
 pub type PointRing = (Vec<(f64, f64)>, Vec<f64>, (f64, f64));
+
+/// 真实感环线：控制点 = 打卡点 + 切向/径向扰动（各 ≤ 限幅），
+/// 使轨迹从打卡点**旁边**经过而非精确穿心（真机轨迹特征：
+/// 径向 CV ≈ 0.25~0.40，起终点自然错开，轮廓不规整）。
+/// `max_offset_m`：控制点偏离打卡点的最大距离（需 <40m 才能打卡成功）。
+pub fn make_organic_ring(
+    bd_points: &[(f64, f64)],
+    rng: &mut Rng,
+    max_offset_m: f64,
+) -> PointRing {
+    let n = bd_points.len();
+    if n < 3 {
+        return make_point_ring(bd_points);
+    }
+    let cx = bd_points.iter().map(|q| q.0).sum::<f64>() / n as f64;
+    let cy = bd_points.iter().map(|q| q.1).sum::<f64>() / n as f64;
+    let mut ordered = bd_points.to_vec();
+    ordered.sort_by(|a, b| {
+        let ka = (a.0 - cx).atan2(a.1 - cy);
+        let kb = (b.0 - cx).atan2(b.1 - cy);
+        ka.partial_cmp(&kb).unwrap()
+    });
+    // 平面坐标（米）
+    let m_lng = m_per_deg_lng(cx);
+    let plane: Vec<(f64, f64)> = ordered
+        .iter()
+        .map(|q| ((q.1 - cy) * m_lng, (q.0 - cx) * MET_PER_DEG_LAT))
+        .collect();
+
+    // 每个打卡点：沿环切向错位 + 沿径向扰动，合成控制点
+    let mut ctrl: Vec<(f64, f64)> = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let prev = plane[(i + n - 1) % n];
+        let cur = plane[i];
+        let next = plane[(i + 1) % n];
+        // 切向单位向量（进入方向 + 离开方向平均）
+        let tin = norm2(cur.0 - prev.0, cur.1 - prev.1);
+        let tout = norm2(next.0 - cur.0, next.1 - cur.1);
+        let tx = tin.0 + tout.0;
+        let ty = tin.1 + tout.1;
+        let t = norm2(tx, ty);
+        // 径向单位向量（远离质心）
+        let r = norm2(cur.0, cur.1);
+        // 扰动幅度：切向 ≤ 60% 限幅、径向 ≤ 45% 限幅
+        let tang = rng.uniform(-0.6, 0.6) * max_offset_m;
+        let radi = rng.uniform(-0.45, 0.45) * max_offset_m;
+        let px = cur.0 + t.0 * tang + r.0 * radi;
+        let py = cur.1 + t.1 * tang + r.1 * radi;
+        ctrl.push((px, py));
+
+        // 相邻打卡点之间插入 1 个"拐角"控制点，制造真实场地的直线段/凸起
+        let mx = (cur.0 + next.0) * 0.5;
+        let my = (cur.1 + next.1) * 0.5;
+        let seg = norm2(next.0 - cur.0, next.1 - cur.1);
+        if seg.0.hypot(seg.1) > 25.0 {
+            // 中点相对弦的横向偏移（±18% 弦长，限 22m）
+            let amp = rng.uniform(-0.18, 0.18) * seg.0.hypot(seg.1).min(120.0);
+            let nx = -seg.1;
+            let ny = seg.0;
+            ctrl.push((mx + nx * amp, my + ny * amp));
+        }
+    }
+    if ctrl.len() < 4 {
+        return make_point_ring(bd_points);
+    }
+    let dense = catmull_rom_closed(&ctrl, 14);
+    let arcs = arc_table(&dense);
+    (dense, arcs, (cx, cy))
+}
+
+/// 二维单位化。
+fn norm2(x: f64, y: f64) -> (f64, f64) {
+    let len = x.hypot(y);
+    if len < 1e-9 {
+        (0.0, 0.0)
+    } else {
+        (x / len, y / len)
+    }
+}
+
+/// 闭合 Catmull-Rom 采样。
+fn catmull_rom_closed(ctrl: &[(f64, f64)], samples: usize) -> Vec<(f64, f64)> {
+    let n = ctrl.len();
+    let mut dense = Vec::with_capacity(n * samples);
+    for i in 0..n {
+        let p0 = ctrl[(i + n - 1) % n];
+        let p1 = ctrl[i];
+        let p2 = ctrl[(i + 1) % n];
+        let p3 = ctrl[(i + 2) % n];
+        for j in 0..samples {
+            let t = j as f64 / samples as f64;
+            let (t2, t3) = (t * t, t * t * t);
+            let x = 0.5
+                * ((2.0 * p1.0)
+                    + (-p0.0 + p2.0) * t
+                    + (2.0 * p0.0 - 5.0 * p1.0 + 4.0 * p2.0 - p3.0) * t2
+                    + (-p0.0 + 3.0 * p1.0 - 3.0 * p2.0 + p3.0) * t3);
+            let y = 0.5
+                * ((2.0 * p1.1)
+                    + (-p0.1 + p2.1) * t
+                    + (2.0 * p0.1 - 5.0 * p1.1 + 4.0 * p2.1 - p3.1) * t2
+                    + (-p0.1 + 3.0 * p1.1 - 3.0 * p2.1 + p3.1) * t3);
+            dense.push((x, y));
+        }
+    }
+    dense
+}
+
+/// 闭合路径累积弧长表（长度 = 点数 + 1，末项为总长）。
+fn arc_table(dense: &[(f64, f64)]) -> Vec<f64> {
+    let mut arcs = vec![0.0f64];
+    for i in 1..=dense.len() {
+        let a = dense[i - 1];
+        let b = dense[i % dense.len()];
+        arcs.push(arcs[i - 1] + ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt());
+    }
+    arcs
+}
+
 pub fn make_point_ring(bd_points: &[(f64, f64)]) -> PointRing {
     let n = bd_points.len();
     let cx = bd_points.iter().map(|q| q.0).sum::<f64>() / n as f64;
@@ -73,9 +199,10 @@ pub fn make_point_ring(bd_points: &[(f64, f64)]) -> PointRing {
         let kb = (b.0 - cx).atan2(b.1 - cy);
         ka.partial_cmp(&kb).unwrap()
     });
+    let m_lng = m_per_deg_lng(cx);
     let plane: Vec<(f64, f64)> = ordered
         .iter()
-        .map(|q| ((q.1 - cy) * MET_PER_DEG_LNG, (q.0 - cx) * MET_PER_DEG_LAT))
+        .map(|q| ((q.1 - cy) * m_lng, (q.0 - cx) * MET_PER_DEG_LAT))
         .collect();
     let samples = 18usize;
     let mut dense = Vec::with_capacity(n * samples);
@@ -136,7 +263,8 @@ pub fn ring_point_at(dense: &[(f64, f64)], arcs: &[f64], s: f64) -> (f64, f64) {
 }
 
 pub fn to_bd(x: f64, y: f64, c_lat: f64, c_lng: f64) -> (f64, f64) {
-    (c_lat + y / MET_PER_DEG_LAT, c_lng + x / MET_PER_DEG_LNG)
+    let m_lng = m_per_deg_lng(c_lat);
+    (c_lat + y / MET_PER_DEG_LAT, c_lng + x / m_lng)
 }
 
 // ── 坐标基准转换：WGS84 ↔ GCJ-02 ↔ BD-09 ─────────────────────────
@@ -145,7 +273,7 @@ pub fn to_bd(x: f64, y: f64, c_lat: f64, c_lng: f64) -> (f64, f64) {
 
 const X_PI: f64 = std::f64::consts::PI * 3000.0 / 180.0;
 const WGS_A: f64 = 6378245.0;
-const WGS_EE: f64 = 0.00669342162296594323;
+const WGS_EE: f64 = 0.006_693_421_622_965_943;
 
 fn out_of_china(lat: f64, lng: f64) -> bool {
     lng < 72.004 || lng > 137.8347 || lat < 0.8293 || lat > 55.8271
@@ -205,4 +333,258 @@ pub fn fmt_gain_time(ms: i64) -> String {
         .single()
         .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
         .unwrap_or_default()
+}
+
+/// 体育场形（标准 400m 跑道）参数：中心、旋转角、弯道半径、直道半长。
+#[derive(Clone, Copy, Debug)]
+pub struct Stadium {
+    pub cx: f64,
+    pub cy: f64,
+    /// 主轴方向（弧度）
+    pub rot: f64,
+    /// 弯道半径（米）
+    pub radius: f64,
+    /// 弯道圆心到中心的距离（米），直道总长 = 4×d
+    pub d: f64,
+}
+
+impl Stadium {
+    /// 周长：2 条直道 + 2 个半圆。
+    pub fn perimeter(&self) -> f64 {
+        4.0 * self.d + 2.0 * std::f64::consts::PI * self.radius
+    }
+
+    /// 弧长 s（从北弯道起点起算）→ 局部坐标 (x, y)（主轴系）。
+    fn at(&self, s: f64) -> (f64, f64) {
+        let total = self.perimeter();
+        let mut s = s.rem_euclid(total);
+        let (w, d) = (self.radius, self.d);
+        let arc = std::f64::consts::PI * w; // 半圆弧长
+        // ① 北半圆：从 (+w, +d) 逆时针到 (-w, +d)
+        if s <= arc {
+            let a = s / w;
+            return (w * a.cos(), d + w * a.sin());
+        }
+        s -= arc;
+        // ② 西直道：(-w, +d) → (-w, -d)
+        if s <= 2.0 * d {
+            return (-w, d - s);
+        }
+        s -= 2.0 * d;
+        // ③ 南半圆：(-w, -d) 逆时针到 (+w, -d)
+        if s <= arc {
+            let a = std::f64::consts::PI + s / w;
+            return (w * a.cos(), -d + w * a.sin());
+        }
+        s -= arc;
+        // ④ 东直道：(+w, -d) → (+w, +d)
+        (w, -d + s.min(2.0 * d))
+    }
+
+    /// 弧长 → BD 系经纬度。
+    pub fn point_at(&self, s: f64) -> (f64, f64) {
+        let (lx, ly) = self.at(s);
+        let (sn, cs) = self.rot.sin_cos();
+        let x = lx * cs - ly * sn;
+        let y = lx * sn + ly * cs;
+        let m_lng = m_per_deg_lng(self.cy);
+        (self.cy + y / MET_PER_DEG_LAT, self.cx + x / m_lng)
+    }
+
+    /// 点到跑道线的最近距离（米，局部系）。
+    pub fn distance_to(&self, lat: f64, lng: f64) -> f64 {
+        let m_lng = m_per_deg_lng(self.cy);
+        let x = (lng - self.cx) * m_lng;
+        let y = (lat - self.cy) * MET_PER_DEG_LAT;
+        let (sn, cs) = self.rot.sin_cos();
+        // 反旋转到主轴系
+        let lx = x * cs + y * sn;
+        let ly = -x * sn + y * cs;
+        let (w, d) = (self.radius, self.d);
+        let ax = lx.abs();
+        let ay = ly.abs();
+        if ay <= d {
+            (ax - w).abs()
+        } else {
+            let r = (ax * ax + (ay - d) * (ay - d)).sqrt();
+            (r - w).abs()
+        }
+    }
+}
+
+/// 由打卡点拟合体育场形跑道（PCA 主轴 + 极值包络）。
+/// `fence_bd`：电子围栏顶点（BD 系，可选）——围栏包裹整个操场，
+/// 用它的主轴长度做跑道长轴下界（打卡点未必覆盖跑道全长）。
+/// 返回 (stadium, 弧长表, 稠密采样点) —— 采样点为平面米制。
+pub fn fit_stadium(
+    bd_points: &[(f64, f64)],
+    rng: &mut Rng,
+    fence_bd: Option<&[(f64, f64)]>,
+) -> (Stadium, Vec<f64>, Vec<(f64, f64)>) {
+    let n = bd_points.len().max(1) as f64;
+    let cx = bd_points.iter().map(|q| q.1).sum::<f64>() / n;
+    let cy = bd_points.iter().map(|q| q.0).sum::<f64>() / n;
+
+    // 平面坐标（米）
+    let m_lng = m_per_deg_lng(cy);
+    let plane: Vec<(f64, f64)> = bd_points
+        .iter()
+        .map(|q| ((q.1 - cx) * m_lng, (q.0 - cy) * MET_PER_DEG_LAT))
+        .collect();
+
+    // PCA 主轴：最大方差方向
+    let (mut sxx, mut syy, mut sxy) = (0.0f64, 0.0f64, 0.0f64);
+    for &(x, y) in &plane {
+        sxx += x * x;
+        syy += y * y;
+        sxy += x * y;
+    }
+    // PCA 的最大方差方向原本是局部 x；Stadium 的长轴沿局部 y。
+    let rot = 0.5 * (2.0 * sxy).atan2(sxx - syy) - std::f64::consts::FRAC_PI_2;
+
+    // 主轴系包络（鲁棒：中位数半径，兼顾离群点）
+    let (sn, cs) = rot.sin_cos();
+    let mut lxs: Vec<f64> = Vec::with_capacity(plane.len());
+    let mut lys: Vec<f64> = Vec::with_capacity(plane.len());
+    for &(x, y) in &plane {
+        let lx = x * cs + y * sn;
+        let ly = -x * sn + y * cs;
+        lxs.push(lx.abs());
+        lys.push(ly.abs());
+    }
+    lxs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    lys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let med_lx = lxs[lxs.len() / 2];
+    let max_ly = *lys.last().unwrap_or(&30.0);
+    // 半径 = 打卡点横向中位（跑道中心线穿过点群），外扩 6% 容纳道次；
+    // 若个别点横向离群（松散布点），外扩半径保证所有点仍在跑道带 ≤40m 内。
+    let mut radius = (med_lx * 1.06).max(18.0);
+    for &lx in &lxs {
+        if lx > radius + 40.0 {
+            radius = lx - 36.0; // 留 4m 余量（<40m 打卡阈值）
+        }
+    }
+    let d = (max_ly - radius).max(6.0);
+    // 围栏只是边界，不是跑道测绘数据；不再用猜测比例扩张跑道。
+    // 调用方必须分别检查几何包含关系，不能把拟合结果当成真实跑道。
+    let _ = fence_bd;
+    let stadium = Stadium { cx, cy, rot, radius, d };
+
+    // 稠密采样（每 2m 一点，含轻微径向扰动消除"完美跑道"感）
+    let total = stadium.perimeter();
+    let steps = (total / 2.0).max(64.0) as usize;
+    let mut dense = Vec::with_capacity(steps);
+    for i in 0..steps {
+        let s = total * i as f64 / steps as f64;
+        let (lx, ly) = stadium.at(s);
+        // 径向扰动：以 ±0.8m 的高频抖动模拟真实 GPS 沿跑道内外摆动
+        let jitter = rng.uniform(-0.8, 0.8);
+        let (px, py) = if ly.abs() <= stadium.d {
+            // 直道：横向（径向）偏移
+            let sign = if lx >= 0.0 { 1.0 } else { -1.0 };
+            (lx + sign * jitter, ly)
+        } else {
+            // 弯道：沿半径方向偏移
+            let r = (lx * lx + (ly.abs() - stadium.d) * (ly.abs() - stadium.d)).sqrt();
+            let k = (r + jitter) / r.max(1e-6);
+            let ny = if ly >= 0.0 { stadium.d } else { -stadium.d };
+            (lx * k, ny + (ly - ny) * k)
+        };
+        // 主轴系 → 平面米制（与 make_point_ring 的 dense 语义一致，由调用方 to_bd 转回度）
+        let x = px * cs - py * sn;
+        let y = px * sn + py * cs;
+        dense.push((x, y));
+    }
+    let arcs = arc_table(&dense);
+    (stadium, arcs, dense)
+}
+
+/// 体育场形环（与 make_point_ring 同签名）：拟合打卡点 → 采样点、弧长表和中心。
+/// 点位拟合结果不代表已测绘的跑道，也不保证最终轨迹落在围栏内。
+pub fn make_stadium_ring(
+    bd_points: &[(f64, f64)],
+    rng: &mut Rng,
+    fence_bd: Option<&[(f64, f64)]>,
+) -> PointRing {
+    assert!(!bd_points.is_empty(), "拟合跑道需要有效点位");
+    let (stadium, arcs, dense) = fit_stadium(bd_points, rng, fence_bd);
+    // 覆盖校验：所有打卡点到跑道线 ≤40m 才用体育场形（真实跑道场景成立）；
+    // 松散布点（如测试五边形）回退经典打卡点环，保证打卡达标。
+    let all_covered = bd_points
+        .iter()
+        .all(|q| stadium.distance_to(q.0, q.1) <= 40.0);
+    if !all_covered {
+        return make_point_ring(bd_points);
+    }
+    // 质心返回 BD 系（与 make_point_ring 的 pc 语义一致，供 to_bd 使用）
+    let n = bd_points.len().max(1) as f64;
+    let c_lat = bd_points.iter().map(|q| q.0).sum::<f64>() / n;
+    let c_lng = bd_points.iter().map(|q| q.1).sum::<f64>() / n;
+    (dense, arcs, (c_lat, c_lng))
+}
+
+/// 平面点集的短轴半径估计（最小包围盒短边/2）——漂移幅度上限用。
+#[cfg(test)]
+mod projection_regression_tests {
+    use super::*;
+
+    #[test]
+    fn point_ring_preserves_east_west_at_jiangmen_latitude() {
+        let pts = [(22.4, 112.95), (22.4003, 112.951), (22.3997, 112.949)];
+        let (dense, _, (lat, lon)) = make_point_ring(&pts);
+        // Catmull-Rom 的每段首点就是原始控制点；前向和逆向投影须相互抵消。
+        for i in 0..pts.len() {
+            let (x, y) = dense[i * 18];
+            let recovered = to_bd(x, y, lat, lon);
+            assert!(pts.iter().any(|p| (p.0-recovered.0).abs() < 1e-9 && (p.1-recovered.1).abs() < 1e-9));
+        }
+    }
+
+    #[test]
+    fn stadium_major_axis_matches_long_direction() {
+        let lat = 22.4;
+        let lon = 112.95;
+        let pts: Vec<_> = [(-100.,-30.), (-100.,30.), (100.,-30.), (100.,30.)]
+            .iter().map(|&(x,y)| (lat + y / MET_PER_DEG_LAT, lon + x / m_per_deg_lng(lat))).collect();
+        let (stadium, _, _) = fit_stadium(&pts, &mut Rng::new(1), None);
+        let long_end = stadium.point_at(0.0);
+        let opposite = stadium.point_at(stadium.perimeter()/2.0);
+        // 东西方向的点集：长轴应沿东西方向，而不是南北。
+        let east_west = (long_end.1 - opposite.1).abs() * m_per_deg_lng(lat);
+        let north_south = (long_end.0 - opposite.0).abs() * MET_PER_DEG_LAT;
+        assert!(east_west > north_south, "东西={east_west}, 南北={north_south}");
+    }
+
+    #[test]
+    fn distant_fence_does_not_inflate_fit() {
+        let pts = [(22.4,112.95), (22.401,112.95), (22.4,112.951), (22.399,112.95)];
+        let far = [(22.5,113.05), (22.5,113.06), (22.51,113.06), (22.51,113.05)];
+        let (a, _, _) = fit_stadium(&pts, &mut Rng::new(1), None);
+        let (b, _, _) = fit_stadium(&pts, &mut Rng::new(1), Some(&far));
+        assert_eq!(a.perimeter(), b.perimeter());
+    }
+}
+
+pub fn short_axis_radius(dense: &[(f64, f64)]) -> f64 {
+    if dense.is_empty() {
+        return 40.0;
+    }
+    let (mut sxx, mut syy, mut sxy) = (0.0f64, 0.0f64, 0.0f64);
+    let n = dense.len() as f64;
+    let cx = dense.iter().map(|q| q.0).sum::<f64>() / n;
+    let cy = dense.iter().map(|q| q.1).sum::<f64>() / n;
+    for &(x, y) in dense {
+        let (dx, dy) = (x - cx, y - cy);
+        sxx += dx * dx;
+        syy += dy * dy;
+        sxy += dx * dy;
+    }
+    let rot = 0.5 * (2.0 * sxy).atan2(sxx - syy);
+    let (sn, cs) = rot.sin_cos();
+    let mut w: Vec<f64> = dense
+        .iter()
+        .map(|&(x, y)| ((x - cx) * cs + (y - cy) * sn).abs())
+        .collect();
+    w.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    w[w.len() / 2].max(20.0)
 }

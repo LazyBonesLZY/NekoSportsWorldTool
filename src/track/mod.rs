@@ -159,7 +159,7 @@ mod tests {
         assert!(track.totalSteps > 500, "steps={}", track.totalSteps);
     }
 
-    /// 打卡点吸附：轨迹必过点位（<40m 落位）。
+    /// 体育场模式：打卡点 ≤40m 自然经过（非穿心吸附）。
     #[test]
     fn test_point_snapping() {
         let pts = sample_points();
@@ -174,7 +174,7 @@ mod tests {
                     .sqrt()
                 })
                 .fold(f64::INFINITY, f64::min);
-            assert!(min_m < 1.0, "点位吸附失败: {min_m}m");
+            assert!(min_m <= 40.0, "打卡点未在 40m 内经过: {min_m}m");
         }
     }
 
@@ -194,7 +194,7 @@ mod tests {
             for &(dist, dur) in &combos {
                 let t = build(dist, dur, seed, (38.9, 121.54), 1_788_958_186_123, &pts);
                 for (i, w) in t.speedPerTenSec.iter().enumerate() {
-                    let pace = 1000.0 / (w.value / 10.0); // 秒/km
+                    let pace = 1000.0 / (w.value / w.time as f64); // 秒/km，尾窗按实际时长
                     assert!(
                         (141.0..=600.0).contains(&pace),
                         "seed={seed} dist={dist} 窗{i} 配速 {}/km 越界",
@@ -309,7 +309,8 @@ mod tests {
                 "speed_json",
                 "step_freq_json",
                 "laps_json",
-                "runFaceCheck"
+                "runFaceCheck",
+                "extension_json"
             ]
         );
         // rrid gzip 可解
@@ -319,7 +320,7 @@ mod tests {
         let mut s = String::new();
         dec.read_to_string(&mut s).unwrap();
         assert_eq!(s, "1320403809");
-        // run_data 解包 → 27 键点集
+        // run_data 解包 → iOS 7.4.0 实机 22 键点集（数值字段为格式化字符串）
         let raw = crate::crypto::envelope::b64_decode(obj["run_data"].as_str().unwrap()).unwrap();
         let mut dec = flate2::read::GzDecoder::new(&raw[..]);
         let mut s = String::new();
@@ -328,7 +329,12 @@ mod tests {
         assert_eq!(wrap["useZip"], false);
         let pts: Vec<serde_json::Value> =
             serde_json::from_str(wrap["allLocJson"].as_str().unwrap()).unwrap();
-        assert_eq!(pts[0].as_object().unwrap().len(), 27, "点键数必须 27");
+        assert_eq!(pts[0].as_object().unwrap().len(), 22, "点键数必须 22（iOS 7.4.0）");
+        // 数值字段为字符串（实机 stringWithFormat）
+        assert!(pts[0]["gLat"].is_string(), "gLat 必须为 \"%.6f\" 字符串");
+        assert!(pts[0]["speed"].is_string(), "speed 必须为 \"%.2f\" 字符串");
+        assert_eq!(pts[0]["lat"], 0);
+        assert_eq!(pts[0]["locType"], 0);
         // segment_json 是空串 gzip
         let raw =
             crate::crypto::envelope::b64_decode(obj["segment_json"].as_str().unwrap()).unwrap();

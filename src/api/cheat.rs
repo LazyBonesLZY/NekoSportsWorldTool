@@ -40,7 +40,8 @@ pub fn query(client: &mut ApiClient, page: i64, log: &mut dyn FnMut(&str)) -> Re
         .as_ref()
         .map(|s| s.unid.parse().unwrap_or(0))
         .unwrap_or(0);
-    let body = json!({ "pageNum": page, "pageSize": 20, "unid": unid }).to_string();
+    // 7.4.0 实机：pageSize 固定 50
+    let body = json!({ "pageNum": page, "pageSize": 50, "unid": unid }).to_string();
     let biz = client.call_host(DISCOVERY, "POST", CHEATLIST_PATH, &body, &[])?;
     let data = super::client::parse_data_field(&biz);
     let list = data

@@ -6,13 +6,58 @@
 //! 哨兵点（首 type∈{0,7}、索引1 type=5、末 type=6）；结尾断崖；点位吸附。
 #![allow(non_snake_case)]
 
-use super::geom::{fmt_gain_time, make_point_ring, ring_point_at, round_to, to_bd, Rng, MET_PER_DEG_LAT, MET_PER_DEG_LNG};
+use super::geom::{
+    fmt_gain_time, m_per_deg_lng, make_stadium_ring, ring_point_at, round_to, to_bd, Rng,
+    MET_PER_DEG_LAT,
+};
 use super::model::{GenPoint, Segment, TenWindow, Track};
 use super::postfix::apply_post_fixes;
 
 /// 有效配速窗口（判定规则 2'21"-10'00"/km ≈ 1.667-7.092 m/s），硬边界留余量。
 pub const SPEED_FLOOR: f64 = 1.90;
 pub const SPEED_CEIL: f64 = 6.30;
+
+/// 将每段恒定速度与步频按真实时间边界拆到连续的十秒窗。
+#[derive(Default)]
+pub(super) struct TenWindowAccumulator {
+    time: f64,
+    distance: f64,
+    steps: f64,
+    speeds: Vec<TenWindow>,
+    step_counts: Vec<TenWindow>,
+}
+
+impl TenWindowAccumulator {
+    pub(super) fn add(&mut self, mut dt: f64, speed: f64, steps_per_second: f64) {
+        while dt > 0.0 {
+            let part = dt.min(10.0 - self.time);
+            self.time += part;
+            self.distance += speed * part;
+            self.steps += steps_per_second * part;
+            dt -= part;
+            if self.time >= 10.0 {
+                self.flush();
+            }
+        }
+    }
+
+    fn flush(&mut self) {
+        // 生成器的时间网格以整秒为单位，尾窗保留实际秒数和累计量。
+        let time = round_to(self.time, 0) as i64;
+        self.speeds.push(TenWindow { time, value: round_to(self.distance, 2) });
+        self.step_counts.push(TenWindow { time, value: round_to(self.steps, 0) });
+        self.time = 0.0;
+        self.distance = 0.0;
+        self.steps = 0.0;
+    }
+
+    pub(super) fn finish(mut self) -> (Vec<TenWindow>, Vec<TenWindow>) {
+        if self.time > 0.0 {
+            self.flush();
+        }
+        (self.speeds, self.step_counts)
+    }
+}
 
 /// 等比缩放逐点速度至目标总距：越界点钳在窗口边界，剩余差量由未饱和点分摊（迭代收敛）。
 /// 与整体等比缩放的区别：任何一点的瞬时配速都不会越出有效窗口。
@@ -33,6 +78,11 @@ fn fit_speeds(w: &mut [f64], dts: &[f64], target: f64) {
 }
 
 /// 轨迹生成主入口。points_bd 为 BD 系打卡点。
+/// 漂移幅度上限：环短轴半径 60%，封顶 60m。
+fn drift_cap(dense: &[(f64, f64)]) -> f64 {
+    60.0f64.min(crate::track::geom::short_axis_radius(dense) * 0.6).max(10.0)
+}
+
 pub fn build(
     dist: f64,
     dur: i64,
@@ -41,9 +91,24 @@ pub fn build(
     start_ms: i64,
     points_bd: &[(f64, f64)],
 ) -> Track {
+    build_with_fence(dist, dur, seed, _center, start_ms, points_bd, None)
+}
+
+/// 带电子围栏的构建：围栏用于约束体育场长轴（跑道被围栏包裹）。
+pub fn build_with_fence(
+    dist: f64,
+    dur: i64,
+    seed: u64,
+    _center: (f64, f64),
+    start_ms: i64,
+    points_bd: &[(f64, f64)],
+    fence_bd: Option<&[(f64, f64)]>,
+) -> Track {
     let mut rng = Rng::new(seed);
     let dur_f = dur as f64;
-    let (dense, arcs, pc) = make_point_ring(points_bd);
+    // 体育场形跑道：PCA 拟合打卡点（打卡点沿真实跑道分布），
+    // 轨迹沿跑道绕圈、从打卡点旁自然经过（≤40m），不再是穿心环
+    let (dense, arcs, pc) = make_stadium_ring(points_bd, &mut rng, fence_bd);
     let (c_lat, c_lng) = pc;
     let direction: f64 = rng.choice(&[1.0, -1.0]);
     let s0 = rng.uniform(0.0, *arcs.last().unwrap_or(&400.0));
@@ -152,11 +217,18 @@ pub fn build(
     let mut alt = 82.0 + rng.uniform(-1.0, 1.0);
     let n_est = 1.max((dur_f / 5.0) as i64);
     let alt_sigma = rng.uniform(3.8, 6.2) / (0.40 * n_est as f64);
-    let mut ten_t = 0.0f64;
-    let mut ten_d = 0.0f64;
-    let mut ten_st = 0.0f64;
-    let mut ten_speed: Vec<TenWindow> = Vec::new();
-    let mut ten_steps: Vec<TenWindow> = Vec::new();
+    let mut ten_windows = TenWindowAccumulator::default();
+
+    // 人性化参数（每跑随机）：切弯深度（圈次递增）、直道疲劳外漂强度
+    let curve_cut0 = rng.uniform(0.5, 2.5);
+    let drift_strength = rng.uniform(0.3, 1.8);
+    // 环质心（平面系）用于判断弯道/直道
+    let (ring_cx, ring_cy) = dense
+        .iter()
+        .fold((0.0f64, 0.0f64), |a, q| (a.0 + q.0, a.1 + q.1));
+    let ring_cx = ring_cx / dense.len().max(1) as f64;
+    let ring_cy = ring_cy / dense.len().max(1) as f64;
+    let laps = dist / arcs.last().unwrap_or(&1.0).max(1.0);
 
     for i in 0..n {
         let dt = dts[i];
@@ -176,10 +248,28 @@ pub fn build(
             let (bx, by) = pos(s);
             x = bx;
             y = by;
+            // 人性化：环上点的径向调整（相对环质心）
+            let prog = t_acc / dur_f;
+            let lap_now = (prog * laps).floor();
+            let radx = bx - ring_cx;
+            let rady = by - ring_cy;
+            let rlen = radx.hypot(rady).max(1e-6);
+            let mut radial = 0.0f64;
+            // 切弯：弯道段（距质心较远处即弯道顶点附近）向内压，深度随圈次递增
+            let curve_zone = rlen > (arcs.last().unwrap_or(&1.0) / std::f64::consts::TAU) * 0.55;
+            if curve_zone {
+                radial -= curve_cut0 * (1.0 + 0.35 * lap_now) * rng.uniform(0.6, 1.0);
+            } else if prog > 0.35 && rng.random() < 0.30 {
+                // 直道疲劳：后程向外漂
+                radial += drift_strength * prog * rng.uniform(0.4, 1.0);
+            }
+            let k = ((rlen + radial) / rlen).clamp(0.65, 1.35);
+            let hx = ring_cx + radx * k;
+            let hy = ring_cy + rady * k;
             jx = 0.72 * jx + rng.gauss(0.0, 0.75);
             jy = 0.72 * jy + rng.gauss(0.0, 0.75);
-            px = bx + jx;
-            py = by + jy;
+            px = hx + jx;
+            py = hy + jy;
             rad = round_to(
                 if typ == 3 { rng.uniform(1.4, 5.1) } else { rng.uniform(1.4, 2.4) },
                 2,
@@ -191,21 +281,27 @@ pub fn build(
             };
         } else {
             match lt {
+                // 所有漂移幅度统一受限：不超过环短轴半径 60%（体育场小环防跳出围栏）
                 4 => {
+                    let cap = drift_cap(&dense);
                     if rng.random() >= 0.68 {
-                        d_step = if rng.random() < 0.95 { rng.uniform(2.0, 60.0) } else { rng.uniform(60.0, 250.0) };
+                        d_step = if rng.random() < 0.95 { rng.uniform(2.0, 60.0).min(cap) } else { rng.uniform(60.0, 250.0).min(cap) };
                     }
                 }
                 1 => {
                     if rng.random() >= 0.83 {
-                        d_step = rng.uniform(0.5, 36.0);
+                        d_step = rng.uniform(0.5, 36.0).min(drift_cap(&dense));
                     }
                 }
                 12 => {
-                    d_step = if rng.random() < 0.9 { rng.uniform(5.0, 80.0) } else { rng.uniform(80.0, 220.0) };
+                    let cap = drift_cap(&dense);
+                    d_step = if rng.random() < 0.9 { rng.uniform(5.0, 80.0).min(cap) } else { rng.uniform(80.0, 220.0).min(cap) };
                 }
-                5 => d_step = rng.uniform(5.0, 60.0),
-                _ => d_step = rng.uniform(100.0, 300.0),
+                5 => d_step = rng.uniform(5.0, 60.0).min(drift_cap(&dense)),
+                _ => {
+                    let cap = drift_cap(&dense);
+                    d_step = rng.uniform((cap * 0.3).max(20.0), cap.max(25.0));
+                }
             }
             let (bx, by) = pos(s);
             x = bx;
@@ -217,7 +313,7 @@ pub fn build(
             } else if let Some(last) = locs.last() {
                 // 零位移：精确复制上一点坐标（BD→平面）
                 py = (last.gLat - c_lat) * MET_PER_DEG_LAT;
-                px = (last.gLng - c_lng) * MET_PER_DEG_LNG;
+                px = (last.gLng - c_lng) * m_per_deg_lng(c_lat);
             } else {
                 px = x + jx;
                 py = y + jy;
@@ -271,18 +367,7 @@ pub fn build(
             (avg, gps)
         };
 
-        ten_t += dt;
-        ten_d += speeds[i] * dt;
-        ten_st += cad / 60.0 * dt;
-        while ten_t >= 10.0 {
-            let k = 10.0 / ten_t; // 只取前 10s 的量，余量留给下一窗
-            let (out_d, out_st) = (ten_d * k, ten_st * k);
-            ten_speed.push(TenWindow { time: 10, value: round_to(out_d, 2) });
-            ten_steps.push(TenWindow { time: 10, value: round_to(out_st, 0) });
-            ten_t -= 10.0;
-            ten_d -= out_d;
-            ten_st -= out_st;
-        }
+        ten_windows.add(dt, speeds[i], cad / 60.0);
         locs.push(GenPoint {
             id: i as i64 + 1,
             flag: start_ms,
@@ -317,12 +402,7 @@ pub fn build(
             locationId: String::new(),
         });
     }
-    if ten_t > 1.0 {
-        // 尾窗：限制放大倍数 ≤1.4
-        let k = (10.0 / ten_t).min(1.4);
-        ten_speed.push(TenWindow { time: 10, value: round_to(ten_d * k, 2) });
-        ten_steps.push(TenWindow { time: 10, value: round_to(ten_st * k, 0) });
-    }
+    let (ten_speed, ten_steps) = ten_windows.finish();
 
     let mut segments: Vec<Segment> = Vec::new();
     let (mut seg_t, mut seg_d, mut seg_n) = (0.0f64, 0.0f64, 0i64);
@@ -352,22 +432,30 @@ pub fn build(
 
     apply_post_fixes(&mut locs, &mut rng, start_ms);
 
-    // 点位吸附：<40m 精确落位
+    // 打卡点经过保障：距离在 (40m, 60m] 的点把最近轨迹点拉到 ~38m（自然路过距离，
+    // 非穿心）；体育场模式通常已 ≤40m 天然满足，不受影响。
     for pl in points_bd {
+        let m_lng = crate::track::geom::m_per_deg_lng(pl.0);
         let mut best_i = None;
         let mut best_d = 1e18f64;
         for (i, q) in locs.iter().enumerate() {
             let dd = ((q.gLat - pl.0) * MET_PER_DEG_LAT).powi(2)
-                + ((q.gLng - pl.1) * MET_PER_DEG_LNG).powi(2);
+                + ((q.gLng - pl.1) * m_lng).powi(2);
             if dd < best_d {
                 best_d = dd;
                 best_i = Some(i);
             }
         }
         if let Some(i) = best_i {
-            if best_d < 40.0 * 40.0 {
-                locs[i].gLat = round_to(pl.0, 7);
-                locs[i].gLng = round_to(pl.1, 7);
+            let d = best_d.sqrt();
+            if d > 40.0 && d <= 60.0 {
+                // 沿"轨迹点→打卡点"方向回拉至 38m
+                let (q, rest) = locs.split_at_mut(i);
+                let _ = q;
+                let p = &mut rest[0];
+                let k = 38.0 / d;
+                p.gLat += (pl.0 - p.gLat) * (1.0 - k);
+                p.gLng += (pl.1 - p.gLng) * (1.0 - k);
             }
         }
     }
@@ -386,5 +474,77 @@ pub fn build(
         speedPerTenSec: ten_speed,
         stepsPerTenSec: ten_steps,
         segments,
+    }
+}
+
+#[cfg(test)]
+mod ten_window_tests {
+    use super::*;
+
+    #[test]
+    fn splits_each_interval_at_boundaries_and_retains_one_second_tail() {
+        let mut windows = TenWindowAccumulator::default();
+        windows.add(4.0, 2.0, 1.0);
+        windows.add(8.0, 4.0, 3.0);
+        // 单个采样段跨越多个完整窗和尾窗。
+        windows.add(19.0, 3.0, 2.0);
+        let (speed, steps) = windows.finish();
+        assert_eq!(speed.iter().map(|w| (w.time, w.value)).collect::<Vec<_>>(),
+                   vec![(10, 32.0), (10, 32.0), (10, 30.0), (1, 3.0)]);
+        assert_eq!(steps.iter().map(|w| (w.time, w.value)).collect::<Vec<_>>(),
+                   vec![(10, 22.0), (10, 22.0), (10, 20.0), (1, 2.0)]);
+    }
+
+    #[test]
+    fn exact_boundary_and_empty_input_have_no_extra_window() {
+        let (speed, steps) = TenWindowAccumulator::default().finish();
+        assert!(speed.is_empty() && steps.is_empty());
+        let mut windows = TenWindowAccumulator::default();
+        windows.add(10.0, 2.0, 1.5);
+        let (speed, steps) = windows.finish();
+        assert_eq!(speed.len(), 1);
+        assert_eq!((speed[0].time, speed[0].value), (10, 20.0));
+        assert_eq!((steps[0].time, steps[0].value), (10, 15.0));
+    }
+
+    #[test]
+    fn every_partial_tail_keeps_its_actual_duration_and_amounts() {
+        for tail in 1..10 {
+            let mut windows = TenWindowAccumulator::default();
+            windows.add((10 + tail) as f64, 2.5, 2.0);
+            let (speed, steps) = windows.finish();
+            assert_eq!((speed[1].time, speed[1].value), (tail, tail as f64 * 2.5));
+            assert_eq!((steps[1].time, steps[1].value), (tail, tail as f64 * 2.0));
+        }
+    }
+
+    #[test]
+    fn legacy_track_preserves_actual_tail_and_rounded_totals() {
+        let points = [(38.901678, 121.540241), (38.902564, 121.541233),
+                      (38.900921, 121.542310), (38.899823, 121.541010),
+                      (38.900455, 121.539512)];
+        for duration in [1211, 1219, 1220] {
+            let track = build(3300.0, duration, 42, (38.9, 121.54), 1_788_958_186_123, &points);
+            assert_window_totals(&track, duration);
+        }
+    }
+
+    pub(super) fn assert_window_totals(track: &Track, duration: i64) {
+        let speed = &track.speedPerTenSec;
+        let steps = &track.stepsPerTenSec;
+        assert_eq!(speed.len(), ((duration + 9) / 10) as usize);
+        assert_eq!(speed.len(), steps.len());
+        let tail = if duration % 10 == 0 { 10 } else { duration % 10 };
+        assert_eq!(speed.last().unwrap().time, tail);
+        assert_eq!(steps.last().unwrap().time, tail);
+        assert_eq!(speed.iter().map(|w| w.time).sum::<i64>(), duration);
+        for (a, b) in speed.iter().zip(steps) {
+            assert_eq!(a.time, b.time);
+        }
+        // 每窗独立舍入，允许每个窗最多半个单位的累计误差。
+        assert!((speed.iter().map(|w| w.value).sum::<f64>() - track.totalDistance).abs()
+                <= speed.len() as f64 * 0.005 + 1.01);
+        assert!((steps.iter().map(|w| w.value).sum::<f64>() - track.totalSteps as f64).abs()
+                <= steps.len() as f64 * 0.5 + 1.0);
     }
 }

@@ -8,12 +8,12 @@
 //!
 //! 协议字段/哨兵/断崖/吸附/10s 窗与经典模式完全一致。
 
-use super::generator::{SPEED_CEIL, SPEED_FLOOR};
+use super::generator::{TenWindowAccumulator, SPEED_CEIL, SPEED_FLOOR};
 use super::geom::{
     fmt_gain_time, ring_point_at, round_to, to_bd, wgs84_to_bd09, Rng, MET_PER_DEG_LAT,
-    MET_PER_DEG_LNG,
+    m_per_deg_lng,
 };
-use super::model::{GenPoint, Segment, TenWindow, Track};
+use super::model::{GenPoint, Segment, Track};
 use super::postfix::apply_post_fixes;
 use route_planner::{
     fatigue_from_km, gait, ou_cadence_series, pace_profile, plan_route_split, point_in_polygon,
@@ -184,7 +184,7 @@ fn route_ring(route: &Route, c_lat: f64, c_lng: f64) -> (Vec<(f64, f64)>, Vec<f6
         .iter()
         .map(|p| {
             (
-                (p.lon - c_lng) * MET_PER_DEG_LNG,
+                (p.lon - c_lng) * m_per_deg_lng(c_lat),
                 (p.lat - c_lat) * MET_PER_DEG_LAT,
             )
         })
@@ -307,7 +307,7 @@ pub fn build_road(
         &net.buildings,
         |c| {
             [
-                (c.lon - c_lng) * MET_PER_DEG_LNG,
+                (c.lon - c_lng) * m_per_deg_lng(c_lat),
                 (c.lat - c_lat) * MET_PER_DEG_LAT,
             ]
         },
@@ -336,11 +336,7 @@ pub fn build_road(
     let mut alt = 82.0 + rng.uniform(-1.0, 1.0);
     let n_est = 1.max((dur_f / 5.0) as i64);
     let alt_sigma = rng.uniform(3.8, 6.2) / (0.40 * n_est as f64);
-    let mut ten_t = 0.0f64;
-    let mut ten_d = 0.0f64;
-    let mut ten_st = 0.0f64;
-    let mut ten_speed: Vec<TenWindow> = Vec::new();
-    let mut ten_steps: Vec<TenWindow> = Vec::new();
+    let mut ten_windows = TenWindowAccumulator::default();
 
     for i in 0..n {
         let dt = dts[i];
@@ -419,7 +415,7 @@ pub fn build_road(
                 py = y + d_step * ang.cos();
             } else if let Some(last) = locs.last() {
                 py = (last.gLat - c_lat) * MET_PER_DEG_LAT;
-                px = (last.gLng - c_lng) * MET_PER_DEG_LNG;
+                px = (last.gLng - c_lng) * m_per_deg_lng(c_lat);
             } else {
                 let (jx, jy) = jitter.state();
                 px = x + jx;
@@ -459,12 +455,7 @@ pub fn build_road(
         alt += 0.04 * (82.0 - alt) + rng.gauss(0.0, alt_sigma);
         // 生物力学联动：v=(cad/60)·stride
         let v_now = speeds[i];
-        let mut stride = v_now * 60.0 / cadences[i];
-        if stride > 1.7 {
-            stride = 1.7;
-        } else if stride < 0.5 {
-            stride = 0.5;
-        }
+        let stride = (v_now * 60.0 / cadences[i]).clamp(0.5, 1.7);
         let cad = v_now * 60.0 / stride;
         steps_acc += cad / 60.0 * dt;
         let nxt = pos(s + 2.0);
@@ -490,24 +481,7 @@ pub fn build_road(
             (avg, gps)
         };
 
-        ten_t += dt;
-        ten_d += speeds[i] * dt;
-        ten_st += cad / 60.0 * dt;
-        while ten_t >= 10.0 {
-            let k = 10.0 / ten_t;
-            let (out_d, out_st) = (ten_d * k, ten_st * k);
-            ten_speed.push(TenWindow {
-                time: 10,
-                value: round_to(out_d, 2),
-            });
-            ten_steps.push(TenWindow {
-                time: 10,
-                value: round_to(out_st, 0),
-            });
-            ten_t -= 10.0;
-            ten_d -= out_d;
-            ten_st -= out_st;
-        }
+        ten_windows.add(dt, speeds[i], cad / 60.0);
         locs.push(GenPoint {
             id: i as i64 + 1,
             flag: start_ms,
@@ -542,17 +516,7 @@ pub fn build_road(
             locationId: String::new(),
         });
     }
-    if ten_t > 1.0 {
-        let k = (10.0 / ten_t).min(1.4);
-        ten_speed.push(TenWindow {
-            time: 10,
-            value: round_to(ten_d * k, 2),
-        });
-        ten_steps.push(TenWindow {
-            time: 10,
-            value: round_to(ten_st * k, 0),
-        });
-    }
+    let (ten_speed, ten_steps) = ten_windows.finish();
 
     let mut segments: Vec<Segment> = Vec::new();
     let (mut seg_t, mut seg_d) = (0.0f64, 0.0f64);
@@ -584,8 +548,9 @@ pub fn build_road(
         let mut best_i = None;
         let mut best_d = 1e18f64;
         for (i, q) in locs.iter().enumerate() {
+            let m_lng = m_per_deg_lng(pl.0);
             let dd = ((q.gLat - pl.0) * MET_PER_DEG_LAT).powi(2)
-                + ((q.gLng - pl.1) * MET_PER_DEG_LNG).powi(2);
+                + ((q.gLng - pl.1) * m_lng).powi(2);
             if dd < best_d {
                 best_d = dd;
                 best_i = Some(i);
@@ -614,4 +579,56 @@ pub fn build_road(
         stepsPerTenSec: ten_steps,
         segments,
     })
+}
+
+#[cfg(test)]
+mod ten_window_tests {
+    use super::*;
+    use route_planner::graph::EdgeData;
+
+    #[test]
+    fn road_track_preserves_actual_tail_and_rounded_totals() {
+        let points = [(38.901678, 121.540241), (38.902564, 121.541233),
+                      (38.900921, 121.542310), (38.899823, 121.541010),
+                      (38.900455, 121.539512)];
+        let clat = points.iter().map(|p| p.0).sum::<f64>() / points.len() as f64;
+        let clng = points.iter().map(|p| p.1).sum::<f64>() / points.len() as f64;
+        let mut net = RoadGraph::new();
+        let nodes: Vec<_> = (0..7).flat_map(|y| (0..7).map(move |x| (x, y)))
+            .map(|(x, y)| net.add_node(Coord::new(clng + (x as f64 - 3.0) * 0.0012,
+                                                   clat + (y as f64 - 3.0) * 0.0012)))
+            .collect();
+        for y in 0..7 {
+            for x in 0..7 {
+                for (dx, dy) in [(1, 0), (0, 1)] {
+                    if x + dx >= 7 || y + dy >= 7 { continue; }
+                    let edge = EdgeData { way_id: (y * 7 + x + 1) as u64, oneway: false,
+                        highway: "residential".into(), maxspeed_kmh: None, length_m: 111.0 };
+                    let a = nodes[y * 7 + x];
+                    let b = nodes[(y + dy) * 7 + x + dx];
+                    net.add_edge(a, b, edge.clone());
+                    net.add_edge(b, a, edge);
+                }
+            }
+        }
+        net.compute_anchor();
+        net.rebuild_index();
+        for duration in [1211, 1219, 1220] {
+            let track = build_road(3300.0, duration, 42, 1_788_958_186_123,
+                                   &points, &points[1..], &net).expect("road fixture");
+            let speed = &track.speedPerTenSec;
+            let steps = &track.stepsPerTenSec;
+            assert_eq!(speed.len(), ((duration + 9) / 10) as usize);
+            assert_eq!(speed.len(), steps.len());
+            let tail = if duration % 10 == 0 { 10 } else { duration % 10 };
+            assert_eq!(speed.last().unwrap().time, tail);
+            assert_eq!(steps.last().unwrap().time, tail);
+            assert_eq!(speed.iter().map(|w| w.time).sum::<i64>(), duration);
+            assert!(speed.iter().zip(steps).all(|(a, b)| a.time == b.time));
+            assert!((speed.iter().map(|w| w.value).sum::<f64>() - track.totalDistance).abs()
+                    <= speed.len() as f64 * 0.005 + 1.01);
+            assert!((steps.iter().map(|w| w.value).sum::<f64>() - track.totalSteps as f64).abs()
+                    <= steps.len() as f64 * 0.5 + 1.0);
+        }
+    }
 }

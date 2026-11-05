@@ -11,7 +11,6 @@ use crate::location::Coordinate;
 use crate::track::generate_road::RouteMode;
 use crate::track::generator::build as gen_track;
 use crate::track::wire::{build_obs_object, five_point_wrapper, obs_keys};
-use rand_distr::{Distribution, Normal};
 use serde_json::Value;
 
 #[derive(Clone, Copy)]
@@ -82,6 +81,9 @@ pub fn run_full_flow(
 
     // ③ 轨迹生成（必经点 + 打卡点）
     let pts_bd = points::points_bd(&pts);
+    if pts_bd.len() < 3 {
+        return Err("有效点位不足三个，停止生成轨迹，请核对坐标与点位响应".into());
+    }
     // 必经点保持策略顺序置于前端（waypoints[0] 即起点），剩余打卡点去重后按质心角
     // 排序，使环序自然且不破坏必经点顺序。
     let mut route_pts: Vec<(f64, f64)> = pol.must_points.clone();
@@ -120,26 +122,7 @@ pub fn run_full_flow(
     if let Some(&(slat, slon)) = route_pts.first() {
         log(&format!("√ [track] 起点 BD=({slat:.6},{slon:.6})"));
     }
-    // 用打卡点随机偏移更新锚点并持久化：下次拉点位即学校真实坐标，摆脱写死的默认值
-    if !pts_bd.is_empty() {
-        let idx = (rand::random::<f64>() * pts_bd.len() as f64) as usize;
-        let (clat, clng) = pts_bd[idx];
-        let mut rng = rand::thread_rng();
-        let normal = Normal::<f64>::new(0.0, 120.0).unwrap();
-        let dlat =
-            normal.sample(&mut rng).clamp(-200.0, 200.0) / crate::track::geom::MET_PER_DEG_LAT;
-        let dlng =
-            normal.sample(&mut rng).clamp(-200.0, 200.0) / crate::track::geom::MET_PER_DEG_LNG;
-        client.identity.anchor_lat = clat + dlat;
-        client.identity.anchor_lon = clng + dlng;
-        if let Err(e) = super::model::save_identity(&client.identity) {
-            log(&format!("⚠ 锚点持久化失败: {e}"));
-        }
-        // 用漂移后的新锚点重存点位缓存，使缓存锚点与持久化锚点一致，避免预览锚点失配。
-        if let Ok(new_anchor) = client.identity.anchor_coordinate() {
-            let _ = super::model::save_points_cache(new_anchor, &pts);
-        }
-    }
+    // 保持用户配置的锚点不变；读取点位不应隐式改写设备位置。
     // 平均配速须落在有效窗口内（否则逐点速度无法全窗内），越界时修正时长
     let mut params = *params;
     let avg = params.dist / params.dur as f64;
@@ -157,6 +140,9 @@ pub fn run_full_flow(
         ));
         params.dur = fixed_dur;
     }
+    // 围栏并不提供跑道中心线；不将围栏外形当成跑道。
+    let fence_for_stadium: Option<&[(f64, f64)]> = None;
+
     log(&format!(
         "[track] 生成轨迹 {:.0}m / {}s（{} 点位）…",
         params.dist,
@@ -170,13 +156,14 @@ pub fn run_full_flow(
             let cfg = crate::api::model::load_config();
             if cfg.osm_path.is_empty() {
                 log("⚠ [track] 未配置 OSM 路网，回退经典算法");
-                gen_track(
+                crate::track::generator::build_with_fence(
                     params.dist,
                     params.dur,
                     params.seed,
                     (anchor.latitude, anchor.longitude),
                     start_ms,
                     &pts_bd,
+                    fence_for_stadium,
                 )
             } else {
                 match crate::track::generate_road::load_network_path(&cfg.osm_path) {
@@ -243,13 +230,14 @@ pub fn run_full_flow(
                 }
             }
         }
-        RouteMode::Legacy => gen_track(
+        RouteMode::Legacy => crate::track::generator::build_with_fence(
             params.dist,
             params.dur,
             params.seed,
             (anchor.latitude, anchor.longitude),
             start_ms,
             &pts_bd,
+            fence_for_stadium,
         ),
     };
     if let Some(range) = params.manual_altitude_range {
@@ -302,7 +290,7 @@ pub fn run_full_flow(
     sleep_secs(1);
 
     // ⑥ OBS 上传（双 key）
-    log("[obs] 上传 OBS 对象（gzip+base64，10 键）…");
+    log("[obs] 上传 OBS 对象（gzip+base64，11 键）…");
     // 从提交结果回填 track.startTime（含随机秒偏移），保证 body/OBS/flag 全链一致
     let mut track_for_obs = sp.track.clone();
     track_for_obs.startTime = result.start_ms;

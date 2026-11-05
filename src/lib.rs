@@ -1,15 +1,15 @@
 //! Shared desktop and Android application.
 
-mod api;
+pub mod api;
 pub mod cli;
-mod crypto;
+pub mod crypto;
 pub mod location;
 pub mod platform;
 pub mod template;
 mod relaunch;
 mod textlog;
-mod track;
-mod update;
+pub mod track;
+pub mod update;
 
 #[cfg(feature = "gui")]
 mod ui;

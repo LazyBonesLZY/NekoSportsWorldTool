@@ -7,12 +7,55 @@ use super::envelope::{md5_hex, now_ms};
 /// tokenSign 固定后缀（与 Android 签名盐同源）。
 pub const TOKEN_SIGN_SUFFIX: &str = "2slhe02lsfiwowlcixisla_sls-_slaor";
 
-pub const IOS_APP_VERSION: &str = "7.3.40";
-pub const ANDROID_APP_VERSION: &str = "7.3.70";
+pub const IOS_APP_VERSION: &str = "7.4.0";
+/// Android 端当前随 iOS 内核同一大版本（7.4.x 系列）。
+pub const ANDROID_APP_VERSION: &str = "7.4.00";
 
-pub const UA_IOS: &str = "SWCampus/7.3.40 (iPhone; iOS 18.1; Scale/3.00)";
-pub const UA_ANDROID: &str = "Mozilla/5.0 (Linux; Android 14; 22081212C Build/UKQ1.231003.002) AppleWebKit/537.36 SWCampus/7.3.70";
+/// 7.4.0 实机逆向：cpuModel = NXGetLocalArchInfo()->description，真机恒 "arm64"；
+/// "x86_64" 是模拟器签名，真实设备永不出现。
+pub const IOS_CPU_MODEL: &str = "arm64";
 
+/// 真机 iPhone 身份档位（营销名 + UIScreen bounds / bounds×scale），全部为 3x 机型，
+/// 与 UA 的 Scale/3.00 一致。随机身份时整套抽取并持久化，模拟真实设备多样性。
+pub const IOS_DEVICE_POOL: [(&str, &str, &str); 21] = [
+    // iPhone 17 系列（7.4.0 实机映射：iPhone18,1/18,2）
+    ("iPhone 17 Pro", "402x874", "1206x2622"),
+    ("iPhone 17 Pro Max", "440x956", "1320x2868"),
+    ("iPhone 17", "402x874", "1206x2622"),
+    ("iPhone Air", "420x912", "1260x2736"),
+    // iPhone 16 系列
+    ("iPhone 16", "393x852", "1179x2556"),
+    ("iPhone 16 Plus", "428x926", "1284x2778"),
+    ("iPhone 16 Pro", "402x874", "1206x2622"),
+    ("iPhone 16 Pro Max", "440x956", "1320x2868"),
+    // iPhone 15 系列
+    ("iPhone 15", "393x852", "1179x2556"),
+    ("iPhone 15 Pro", "393x852", "1179x2556"),
+    ("iPhone 15 Pro Max", "430x932", "1290x2796"),
+    // iPhone 14 系列
+    ("iPhone 14", "390x844", "1170x2532"),
+    ("iPhone 14 Pro", "393x852", "1179x2556"),
+    ("iPhone 14 Pro Max", "430x932", "1290x2796"),
+    ("iPhone 14 Plus", "428x926", "1284x2778"),
+    // iPhone 13/12 系列
+    ("iPhone 13", "390x844", "1170x2532"),
+    ("iPhone 13 Pro", "390x844", "1170x2532"),
+    ("iPhone 13 mini", "375x812", "1125x2436"),
+    ("iPhone 12", "390x844", "1170x2532"),
+    ("iPhone 12 Pro Max", "428x926", "1284x2778"),
+    ("iPhone 11 Pro Max", "414x896", "1242x2688"),
+];
+
+pub const UA_ANDROID: &str = "Mozilla/5.0 (Linux; Android 14; 22081212C Build/UKQ1.231003.002) AppleWebKit/537.36 SWCampus/7.4.00";
+
+/// 按设备身份动态生成 iOS UA（Alamofire "%@/%@ (%@; iOS %@; Scale/%0.2f)" 格式）。
+/// UA 的 iOS 版本必须与 headerSign.osVersion 一致，否则是显式指纹矛盾。
+pub fn ua_ios_for(os_version: &str) -> String {
+    format!("SWCampus/{IOS_APP_VERSION} (iPhone; iOS {os_version}; Scale/3.00)")
+}
+
+/// 7.4.0 实机逆向：App 的 "IDFA" 并非系统广告标识符，而是 WHSimulateIDFA——
+/// 首次启动生成一个随机 UUID 存钥匙串并终身复用。因此请求头 **永远** 携带该字段。
 /// 设备身份。app_install_time <= 0 表示尚未生成。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HeaderIdentity {
@@ -38,6 +81,12 @@ pub struct HeaderIdentity {
     /// 设备 MAC（首次生成后持久化，避免写死指纹）
     #[serde(default)]
     pub mac_address: String,
+    /// iOS 逻辑分辨率（真机 UIScreen bounds，随机身份时按档位抽取）
+    #[serde(default = "default_logic_pixel")]
+    pub logic_pixel: String,
+    /// iOS 物理分辨率（bounds × scale）
+    #[serde(default = "default_physic_pixel")]
+    pub physic_pixel: String,
     /// 提交 body 的城市名
     #[serde(default = "default_city")]
     pub city: String,
@@ -56,7 +105,9 @@ pub fn random_mac() -> String {
 
 fn default_platform() -> String { "ios".into() }
 fn default_os_version() -> String { "26.5.2".into() }
-fn default_device_name() -> String { "iPhone".into() }
+fn default_device_name() -> String { "iPhone 14 Pro".into() }
+fn default_logic_pixel() -> String { "393x852".into() }
+fn default_physic_pixel() -> String { "1179x2556".into() }
 fn default_anchor_lat() -> f64 { 38.901678 }
 fn default_anchor_lon() -> f64 { 121.540241 }
 fn default_city() -> String { "大连市".into() }
@@ -105,6 +156,8 @@ impl Default for HeaderIdentity {
             anchor_lon: default_anchor_lon(),
             app_install_time: 0,
             mac_address: String::new(),
+            logic_pixel: default_logic_pixel(),
+            physic_pixel: default_physic_pixel(),
             city: default_city(),
         }
     }
@@ -148,12 +201,18 @@ pub fn build_native_ios_header(
         serde_json::Value::String(format!("{device_id}_iOS_sportsWorld_campus")),
     );
     m.insert("osVersion".into(), serde_json::Value::String(identity.os_version.clone()));
-    if !identity.idfa.is_empty() {
-        m.insert("IDFA".into(), serde_json::Value::String(identity.idfa.clone()));
-    }
-    m.insert("logicPixel".into(), serde_json::Value::String("360x640".into()));
-    m.insert("physicPixel".into(), serde_json::Value::String("1080x1920".into()));
-    m.insert("cpuModel".into(), serde_json::Value::String("x86_64".into()));
+    // 7.4.0 实机：WHSimulateIDFA 钥匙串 UUID 终身复用，请求头永远携带（含空值兜底），
+    // 缺失该键即指纹异常。
+    m.insert("IDFA".into(), serde_json::Value::String(
+        if identity.idfa.is_empty() {
+            uuid::Uuid::new_v4().to_string().to_uppercase()
+        } else {
+            identity.idfa.clone()
+        },
+    ));
+    m.insert("logicPixel".into(), serde_json::Value::String(identity.logic_pixel.clone()));
+    m.insert("physicPixel".into(), serde_json::Value::String(identity.physic_pixel.clone()));
+    m.insert("cpuModel".into(), serde_json::Value::String(IOS_CPU_MODEL.into()));
     m.insert("appVersion".into(), serde_json::Value::String(IOS_APP_VERSION.into()));
     m.insert("isRoot".into(), serde_json::Value::Bool(false));
     m.insert("appInstallTime".into(), serde_json::Value::from(install));
@@ -263,7 +322,7 @@ mod tests {
         );
     }
 
-    /// iOS 头键序与条件字段（缺省字段跳过）。
+    /// iOS 头键序与条件字段（缺省字段跳过；IDFA 恒存在——WHSimulateIDFA 钥匙串语义）。
     #[test]
     fn test_ios_header_shape() {
         let identity = HeaderIdentity {
@@ -278,11 +337,14 @@ mod tests {
             keys,
             vec![
                 "osType", "DeviceId", "deviceName", "CustomDeviceId", "osVersion",
-                "logicPixel", "physicPixel", "cpuModel", "appVersion", "isRoot",
+                "IDFA", "logicPixel", "physicPixel", "cpuModel", "appVersion", "isRoot",
                 "appInstallTime", "nonce", "timeStamp", "studentId"
             ]
         );
+        // IDFA 缺省时用随机 UUID 兜底（真机为钥匙串持久 UUID，永不缺失）
+        assert!(uuid::Uuid::parse_str(v["IDFA"].as_str().unwrap()).is_ok());
         assert_eq!(v["osType"], "1");
+        assert_eq!(v["cpuModel"], "arm64");
         assert_eq!(v["studentId"], 0);
         // 带 uid/token 时出现 tokenSign
         let (json2, _) = build_native_ios_header(&identity, 13056447, "TOKEN", Some(1788958186123));
@@ -305,7 +367,7 @@ mod tests {
         let (json, _) = build_android_header(&identity, 42, "TK", Some(1788958186123));
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["osType"], "0");
-        assert_eq!(v["appVersion"], "7.3.70");
+        assert_eq!(v["appVersion"], "7.4.00");
         assert_eq!(v["studentId"], 42);
         assert!(v.get("tokenSign").is_some());
         assert!(json.starts_with("{\"Accept\":\"application/json\""));

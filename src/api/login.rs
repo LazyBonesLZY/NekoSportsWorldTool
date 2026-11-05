@@ -82,7 +82,7 @@ pub fn login(
             })
             .to_string();
             let url = format!("{HOST}{GEEVALIDATE_PATH}");
-            let out = client.envelope_request("POST", &url, &body, crate::crypto::header::UA_IOS, &[])?;
+            let out = client.envelope_request("POST", &url, &body, &client.ua(), &[])?;
             let gv_err = out.decrypted.as_ref().and_then(|d| d.business.get("error").cloned());
             match gv_err.as_ref().and_then(|e| e.as_i64()) {
                 Some(10000) => {
@@ -107,29 +107,50 @@ pub fn login(
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
 
-    // login（Authorization Basic + Android 形态信封 body）
+    // login（Authorization Basic + 信封 body）。body 形态跟随设备身份平台，
+    // 与 headerSign/UA 严格一致；username/password 仅走 Basic 头（7.4.0 实机行为）。
     let identity = client.identity.clone();
     let device_id = if identity.device_id.is_empty() {
         uuid::Uuid::new_v4().to_string().to_uppercase()
     } else {
         identity.device_id.clone()
     };
-    let login_body = json!({
-        "device_model": identity.device_name,
-        "os_version": identity.os_version,
-        "mac_address": identity.mac_address,
-        "imei": "",
-        "loginType": 0,
-        "username": username,
-        "password": password,
-        "uuid": uuid_value,
-        "osType": "0",
-    })
-    .to_string();
+    let login_body = if identity.platform == "android" {
+        // Android 形态（与 build_android_header 同源）：osType="0"，mac 取持久化 MAC。
+        json!({
+            "device_model": identity.device_name,
+            "os_version": identity.os_version,
+            "mac_address": identity.mac_address,
+            "imei": "",
+            "loginType": 0,
+            "username": username,
+            "password": password,
+            "uuid": uuid_value,
+            "osType": "0",
+        })
+        .to_string()
+    } else {
+        // iOS 7.4.0 getEquipmentInformation + loginType/uuid：
+        // device_id/imei 取 WHSimulateIDFA；mac_address 为字面量 "nil"；channel 固定 APPStore。
+        let idfa = identity.idfa.clone();
+        json!({
+            "app_version": crate::crypto::header::IOS_APP_VERSION,
+            "device_model": identity.device_name,
+            "os_version": identity.os_version,
+            "os_type": 1,
+            "device_id": idfa,
+            "mac_address": "nil",
+            "imei": idfa,
+            "channel": "APPStore",
+            "loginType": 0,
+            "uuid": uuid_value,
+        })
+        .to_string()
+    };
     let credential = B64.encode(format!("{username}:{password}"));
     let extra = vec![("Authorization".to_string(), format!("Basic {credential}"))];
     let url = format!("{HOST}{LOGIN_PATH}");
-    let out = client.envelope_request("POST", &url, &login_body, crate::crypto::header::UA_IOS, &extra)?;
+    let out = client.envelope_request("POST", &url, &login_body, &client.ua(), &extra)?;
     let dec = out
         .decrypted
         .ok_or_else(|| format!("HTTP {} 且响应解密失败", out.http_status))?;
@@ -168,11 +189,11 @@ pub fn login(
     eprintln!(
         "[session] uid={} token={} unid={} name={} weight={} device={}",
         sess.uid,
-        &crate::textlog::mask(&sess.token),
+        crate::textlog::mask(&sess.token),
         sess.unid,
         sess.name,
         sess.weight,
-        &sess.device_id
+        sess.device_id
     );
     eprintln!(
         "[session] profile 字段数={}",

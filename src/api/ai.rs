@@ -50,8 +50,8 @@ fn fetch_list_remote(client: &mut ApiClient) -> Result<Vec<AiSport>, String> {
 
 /// 单条 AI 记录全量信息（record/info：含 speed/consume/sportId/reason 等列表没有的字段）。
 pub fn fetch_record_detail(client: &mut ApiClient, id: i64) -> Result<Value, String> {
-    let path = format!("/api/v66/sport/ai/record/info?id={id}");
-    let biz = client.call("GET", &path, "{}", &[])?;
+    let path = "/api/v66/sport/ai/record/info";
+    let biz = client.call("GET", path, &json!({ "id": id }).to_string(), &[])?;
     let data = parse_data_field(&biz);
     if data.is_null() {
         return Err(format!("记录 {id} 无详情数据"));
@@ -79,8 +79,8 @@ pub struct SportInfo {
 
 /// 查询项目详情；失败按计次类处理。
 pub fn fetch_info(client: &mut ApiClient, sport_id: i64) -> Result<SportInfo, String> {
-    let path = format!("/api/v1/sport/ai/info?sportId={sport_id}");
-    let biz = client.call("GET", &path, "{}", &[])?;
+    let path = "/api/v1/sport/ai/info";
+    let biz = client.call("GET", path, &json!({ "sportId": sport_id }).to_string(), &[])?;
     let data = parse_data_field(&biz);
     Ok(SportInfo {
         sport_type: data.get("type").and_then(|v| v.as_i64()).unwrap_or(1),
@@ -128,6 +128,7 @@ pub fn upload(client: &mut ApiClient, sport_id: i64, mode: AiMode, at: Option<i6
         format!("{consume:.1}")
     };
     let score_date = at.unwrap_or(now - time_consume);
+    // 7.4.0 实机 10 键 body：sportId/type/score/timeConsume/speed/consume/上传视频地址/""(占位)/uuid/scoreDate/taskId
     let body = json!({
         "sportId": sport_id,
         "type": body_type,
@@ -135,8 +136,9 @@ pub fn upload(client: &mut ApiClient, sport_id: i64, mode: AiMode, at: Option<i6
         "timeConsume": time_consume,
         "speed": speed.to_string(),
         "consume": consume,
-        "scoreDate": score_date,
+        "上传视频地址": "",
         "uuid": uuid::Uuid::new_v4().to_string(),
+        "scoreDate": score_date,
         "taskId": 0,
     });
     client.call("POST", AI_UPLOAD_PATH, &body.to_string(), &[])
@@ -175,10 +177,13 @@ pub struct AiRecordPage {
 
 /// 拉取某项目的 AI 记录（pageSize 条，按天分组）。
 pub fn fetch_records(client: &mut ApiClient, sport_id: i64, page_size: i64) -> Result<AiRecordPage, String> {
-    let path = format!(
-        "{AI_RECORDS_PATH}?sportId={sport_id}&pageSize={page_size}&pageNum=1"
-    );
-    let biz = client.call("GET", &path, "{}", &[])?;
+    let path = AI_RECORDS_PATH;
+    let biz = client.call(
+        "GET",
+        path,
+        &json!({ "sportId": sport_id, "pageSize": page_size, "pageNum": 1 }).to_string(),
+        &[],
+    )?;
     let data = parse_data_field(&biz);
     let arr = data
         .get("list")

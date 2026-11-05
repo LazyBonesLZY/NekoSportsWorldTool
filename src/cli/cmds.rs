@@ -349,10 +349,8 @@ fn cmd_records_raw(rest: &[&str]) -> i32 {
                     &arr[n - 1].to_string()[..arr[n - 1].to_string().len().min(300)]
                 );
             } else {
-                println!(
-                    "data: {}",
-                    data.to_string()[..data.to_string().len().min(500)].to_string()
-                );
+                let text = data.to_string();
+                println!("data: {}", &text[..text.len().min(500)]);
             }
             0
         }

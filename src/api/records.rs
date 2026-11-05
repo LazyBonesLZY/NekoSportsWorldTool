@@ -1,11 +1,12 @@
 //! 跑步记录。
-//! 列表：POST /api/v70230/runnings/records {}；单条：POST /api/v70260/runnings/get_one_record。
+//! 列表：POST /api/v70230/runnings/records {}；单条：POST /api/v70320/runnings/get_one_record
+//! （7.4.0 从 v70260 迁移到 v70320，body 增加 uuid/calculateBadge）。
 
 use super::client::{get_field, parse_data_field, ApiClient};
 use serde_json::{json, Value};
 
 pub const RECORDS_PATH: &str = "/api/v70230/runnings/records";
-pub const GET_ONE_PATH: &str = "/api/v70260/runnings/get_one_record";
+pub const GET_ONE_PATH: &str = "/api/v70320/runnings/get_one_record";
 
 /// 记录列表行（表格展示用）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

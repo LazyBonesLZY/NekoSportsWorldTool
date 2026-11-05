@@ -85,8 +85,36 @@ impl Track {
     }
 
     pub fn validate_consistency(&self) -> Result<Coordinate, String> {
-        if self.totalTime <= 0 || self.totalDistance <= 0.0 { return Err("轨迹时长和距离必须为正数".into()); }
-        for point in &self.locations { Coordinate::new(point.gLat, point.gLng, point.accuracy)?; }
+        if self.totalTime <= 0 || !self.totalDistance.is_finite() || self.totalDistance <= 0.0 {
+            return Err("轨迹时长和距离必须为正数".into());
+        }
+        if self.speedPerTenSec.len() != self.stepsPerTenSec.len() {
+            return Err("距离窗口与步数窗口数量不一致".into());
+        }
+        let mut window_time = 0i64;
+        for (distance, steps) in self.speedPerTenSec.iter().zip(&self.stepsPerTenSec) {
+            if distance.time <= 0 || distance.time > 10 || distance.time != steps.time
+                || !distance.value.is_finite() || !steps.value.is_finite()
+                || distance.value < 0.0 || steps.value < 0.0
+            {
+                return Err("距离或步数窗口数据无效".into());
+            }
+            window_time += distance.time;
+        }
+        if !self.speedPerTenSec.is_empty() && window_time != self.totalTime {
+            return Err("窗口累计时长与轨迹总时长不一致".into());
+        }
+        let mut previous_time = 0;
+        for point in &self.locations {
+            Coordinate::new(point.gLat, point.gLng, point.accuracy)?;
+            if point.totalTime < previous_time || point.totalTime > self.totalTime {
+                return Err("轨迹点时间倒序或超出总时长".into());
+            }
+            if point.gainTimeMs != self.startTime.saturating_add(point.totalTime.saturating_mul(1000)) {
+                return Err("轨迹点绝对时间与累计时间不一致".into());
+            }
+            previous_time = point.totalTime;
+        }
         self.start_coordinate()
     }
 }
@@ -95,10 +123,19 @@ impl Track {
 mod tests {
     use super::*;
     fn sample_track() -> Track {
-        let point = GenPoint { id: 1, flag: 1, lat: -1.0, lng: -1.0, gLat: 39.9, gLng: 116.4, speed: 1.0, avgSpeed: 1.0, radius: 3.0, accuracy: 3.0, ptype: 0, locType: 1, hasAltitude: true, totalTime: 1, totalDis: 1.0, validDis: 1.0, validTime: 1, steps: 1, stepDistance: 0.0, gainTime: String::new(), gainTimeMs: 1, queueNum: 0, coorType: "gcj02".into(), bdA: 1.0, bdD: 0.0, bdS: 1.0, bdG: 1, count: 1, dtr: 0.0, state: 0, locationId: String::new() };
+        let point = GenPoint { id: 1, flag: 1, lat: -1.0, lng: -1.0, gLat: 39.9, gLng: 116.4, speed: 1.0, avgSpeed: 1.0, radius: 3.0, accuracy: 3.0, ptype: 0, locType: 1, hasAltitude: true, totalTime: 1, totalDis: 1.0, validDis: 1.0, validTime: 1, steps: 1, stepDistance: 0.0, gainTime: String::new(), gainTimeMs: 1001, queueNum: 0, coorType: "gcj02".into(), bdA: 1.0, bdD: 0.0, bdS: 1.0, bdG: 1, count: 1, dtr: 0.0, state: 0, locationId: String::new() };
         Track { totalTime: 1, totalDistance: 1.0, validDistance: 1.0, validTime: 1, startTime: 1, startLatitude: 39.9, startLongitude: 116.4, locations: vec![point], totalSteps: 1, speedPerTenSec: vec![], stepsPerTenSec: vec![], segments: vec![] }
     }
     #[test] fn top_level_coordinate_is_derived_from_first_point() { assert!(sample_track().validate_consistency().is_ok()); let mut invalid = sample_track(); invalid.startLatitude = 38.9; assert!(invalid.validate_consistency().is_err()); }
     #[test] fn empty_track_is_rejected() { let mut track = sample_track(); track.locations.clear(); assert!(track.validate_consistency().is_err()); }
+    #[test]
+    fn rejects_inconsistent_times_and_window_counts() {
+        let mut track = sample_track();
+        track.locations[0].gainTimeMs = 0;
+        assert!(track.validate_consistency().is_err());
+        track.locations[0].gainTimeMs = 1001;
+        track.speedPerTenSec.push(TenWindow { time: 1, value: 1.0 });
+        assert!(track.validate_consistency().is_err());
+    }
 }
 

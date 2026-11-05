@@ -1,11 +1,12 @@
 //! 个人信息。
-//! 聚合：登录 profile / v41/user/HomePageInfo / v41/running/getPersonalSemesterInfo(runMode)
+//! 聚合：登录 profile / v70300/user/homePageBaseUserInfo(GET, 7.4.0 迁移)
+//! / v41/running/getPersonalSemesterInfo(runMode)
 //! / v55 recordssummary / v44 personalSemesterCompleted(需 rrid)。
 
 use super::client::{parse_data_field, ApiClient};
 use serde_json::{json, Value};
 
-pub const HOME_PAGE_INFO_PATH: &str = "/api/v41/user/HomePageInfo";
+pub const HOME_PAGE_INFO_PATH: &str = "/api/v70300/user/homePageBaseUserInfo";
 pub const PERSONAL_SEMESTER_PATH: &str = "/api/v41/running/getPersonalSemesterInfo";
 pub const SEMESTER_COMPLETED_PATH: &str = "/api/v44/runnings/personalSemesterCompleted";
 
@@ -17,6 +18,11 @@ pub struct MyInfo {
     pub completed: Value,
 }
 
+/// 当前登录 uid（未登录取 0）。
+fn uid_of(client: &ApiClient) -> i64 {
+    client.login.as_ref().map(|s| s.uid).unwrap_or(0)
+}
+
 /// 拉取我的页全部数据；单项失败不阻塞其他项。
 pub fn fetch_my_info(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> MyInfo {
     let profile = client
@@ -26,7 +32,7 @@ pub fn fetch_my_info(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> MyInf
         .unwrap_or(Value::Null);
 
     let home_page = client
-        .call("GET", HOME_PAGE_INFO_PATH, "{}", &[])
+        .call("GET", HOME_PAGE_INFO_PATH, &json!({ "uid": uid_of(client) }).to_string(), &[])
         .map(|biz| parse_data_field(&biz))
         .unwrap_or(Value::Null);
     if home_page.is_null() {

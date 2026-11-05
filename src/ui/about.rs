@@ -100,14 +100,12 @@ impl App {
             ui.add_space(6.0);
             if self.update.downloading {
                 self.draw_download_progress(ui);
-            } else if self.update.finish.is_none() {
-                if ui.button("立即更新").clicked() {
-                    if self.any_busy() {
-                        self.status = "有任务进行中，请稍后再试".into();
-                    } else {
-                        let rel = rel.clone();
-                        self.update.confirm = Some(rel);
-                    }
+            } else if self.update.finish.is_none() && ui.button("立即更新").clicked() {
+                if self.any_busy() {
+                    self.status = "有任务进行中，请稍后再试".into();
+                } else {
+                    let rel = rel.clone();
+                    self.update.confirm = Some(rel);
                 }
             }
         }

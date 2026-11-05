@@ -80,6 +80,14 @@ pub struct Config {
     /// 路线算法：legacy | road。
     #[serde(default = "default_route_mode")]
     pub route_mode: String,
+    /// 跑步提交身份形态：ios（默认，7.4.0 实机语义：29 键 body + iOS 签名 + 全链同设备）
+    /// | android（历史实测兼容形态，若 iOS 形态被服务端拒绝时切换）。
+    #[serde(default = "default_submit_form")]
+    pub submit_form: String,
+}
+
+fn default_submit_form() -> String {
+    "ios".into()
 }
 
 fn default_route_mode() -> String {
@@ -123,6 +131,7 @@ impl Default for Config {
             update_check: default_update_check(),
             osm_path: String::new(),
             route_mode: default_route_mode(),
+            submit_form: default_submit_form(),
         }
     }
 }
@@ -179,6 +188,19 @@ fn load_identity_for_platform(platform: &str) -> HeaderIdentity {
     }
     if id.mac_address.is_empty() {
         id.mac_address = crate::crypto::header::random_mac();
+        dirty = true;
+    }
+    // iOS WHSimulateIDFA 语义：随机 UUID 一经生成即终身复用（真机存钥匙串）。
+    if id.platform != "android" && id.idfa.is_empty() {
+        id.idfa = uuid::Uuid::new_v4().to_string().to_uppercase();
+        dirty = true;
+    }
+    if id.logic_pixel.is_empty() {
+        id.logic_pixel = "393x852".into();
+        dirty = true;
+    }
+    if id.physic_pixel.is_empty() {
+        id.physic_pixel = "1179x2556".into();
         dirty = true;
     }
     if dirty {

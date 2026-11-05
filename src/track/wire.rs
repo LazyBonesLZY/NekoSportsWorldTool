@@ -40,58 +40,56 @@ fn gz_str(v: &str) -> String {
     gz(v.as_bytes())
 }
 
-/// 27 键协议点集（gen 点 → OBS 点；gLat/gLng 由 BD 转 GCJ）。
+/// iOS 7.4.0 实机 22 键点集（_buildLocationPathInfo map 块）：数值字段为
+/// "%.2f"/"%.1f"/"%.6f" 格式化字符串（实机 stringWithFormat），gainTime 为
+/// "yyyy-MM-dd HH:mm:ss"；lat/lng 恒 0；locType 恒 0。
 pub fn conv_point(p: &GenPoint, start_ms: i64) -> Value {
     let (glat, glng) = bd09_to_gcj02(p.gLat, p.gLng);
     json!({
-        "avgSpeed": round_to(p.avgSpeed, 4),
-        "bdA": round_to(p.bdA, 2),
-        "bdD": round_to(p.bdD, 2),
-        "bdG": p.bdG,
-        "bdS": round_to(p.bdS, 4),
-        "coorType": "gcj02",
-        "count": p.count,
-        "dtr": 0.0,
-        "flag": start_ms,
-        "gLat": round_to(glat, 7),
-        "gLng": round_to(glng, 7),
-        "gainTime": p.gainTime,
         "id": p.id,
-        "lat": -1.0,
-        "lng": -1.0,
-        "locType": p.locType,
-        "locationId": "",
-        "queueNum": p.queueNum,
-        "radius": round_to(p.radius, 2),
-        "speed": round_to(p.speed, 4),
-        "state": p.state,
-        "stepDistance": 0.0,
-        "totalDis": round_to(p.totalDis, 4),
-        "totalTime": p.totalTime,
+        "flag": start_ms,
+        "speed": format!("{:.2}", p.speed),
+        "avgSpeed": format!("{:.2}", p.avgSpeed),
+        "radius": format!("{:.1}", p.radius),
+        "gainTime": p.gainTime,
         "type": p.ptype,
-        "validDis": round_to(p.validDis, 4),
+        "totalDis": format!("{:.2}", p.totalDis),
+        "totalTime": p.totalTime,
+        "validDis": format!("{:.2}", p.validDis),
         "validTime": p.validTime,
+        "lat": 0,
+        "lng": 0,
+        "gLat": format!("{:.6}", glat),
+        "gLng": format!("{:.6}", glng),
+        "coorType": "gcj02",
+        "bdA": format!("{:.2}", p.bdA),
+        "bdD": format!("{:.2}", p.bdD),
+        "bdS": format!("{:.2}", p.bdS),
+        "locType": 0,
+        "stepDistance": format!("{:.2}", p.stepDistance),
+        "queueNum": p.queueNum,
     })
 }
 
-/// 五点实体（实时点位 → 跑完态 isPass=true）。
+/// 五点实体（iOS 7.4.0 _buildFivePointInfo map 块，10 键）：
+/// lat/lon 恒 0；glat/glon 为 "%.6f" 字符串（GCJ 系）；isPass/isFixed 为 NSNumber bool。
 pub fn five_point_payload(points: &[Value], start_ms: i64) -> Vec<Value> {
     points
         .iter()
         .enumerate()
         .map(|(i, p)| {
+            let gcj = crate::api::points::point_coordinate(p, "glat", "glon");
             json!({
-                "flag": start_ms,
-                "glat": p["glat"].as_f64().unwrap_or(0.0),
-                "glon": p["glon"].as_f64().unwrap_or(0.0),
                 "id": i as i64 + 1,
-                "isFixed": p["isFixed"].as_i64().unwrap_or(0),
+                "flag": start_ms,
                 "isPass": true,
-                "lat": p["lat"].as_f64().unwrap_or(0.0),
-                "lon": p["lon"].as_f64().unwrap_or(0.0),
+                "lat": 0,
+                "lon": 0,
+                "glat": gcj.map(|(lat, _)| format!("{lat:.6}")),
+                "glon": gcj.map(|(_, lon)| format!("{lon:.6}")),
+                "position": p["position"].as_i64().unwrap_or(999),
+                "isFixed": p["isFixed"].as_bool().unwrap_or_else(|| p["isFixed"].as_f64().map(|v| v != 0.0).unwrap_or(false)),
                 "pointName": p["pointName"].as_str().unwrap_or(""),
-                "position": 999,
-                "state": 0,
             })
         })
         .collect()
@@ -111,19 +109,15 @@ pub fn five_point_wrapper(points: &[Value], start_ms: i64) -> String {
 }
 
 /// 校验提交用五点轨迹仍是同一次点位请求产生的有效数据。
+/// iOS 7.4.0 五点实体 lat/lon 恒 0（实机行为），真实坐标在 glat/glon（GCJ 系）。
 pub fn validate_five_point_wrapper(wrapper: &str) -> Result<(), String> {
     let outer: Value = serde_json::from_str(wrapper).map_err(|e| format!("五点轨迹 JSON 无效: {e}"))?;
     let raw = outer.get("fivePointJson").and_then(Value::as_str).ok_or("五点轨迹缺少 fivePointJson")?;
     let points: Vec<Value> = serde_json::from_str(raw).map_err(|e| format!("五点轨迹数组无效: {e}"))?;
     if points.is_empty() { return Err("五点轨迹不能为空".into()); }
     for point in points {
-        let lat = point.get("lat").and_then(Value::as_f64).unwrap_or(0.0);
-        let lon = point.get("lon").and_then(Value::as_f64).unwrap_or(0.0);
-        let glat = point.get("glat").and_then(Value::as_f64).unwrap_or(0.0);
-        let glon = point.get("glon").and_then(Value::as_f64).unwrap_or(0.0);
-        if (lat == 0.0 && lon == 0.0) || (glat == 0.0 && glon == 0.0) { return Err("五点轨迹包含缺失坐标".into()); }
-        crate::location::Coordinate::new(lat, lon, 0.0)?;
-        crate::location::Coordinate::new(glat, glon, 0.0)?;
+        crate::api::points::point_coordinate(&point, "glat", "glon")
+            .ok_or("五点轨迹包含缺失或无效坐标")?;
     }
     Ok(())
 }
@@ -132,6 +126,51 @@ pub fn validate_five_point_wrapper(wrapper: &str) -> Result<(), String> {
 mod validation_tests {
     use super::*;
     #[test] fn rejects_empty_or_malformed_five_point_payload() { assert!(validate_five_point_wrapper("{}").is_err()); assert!(validate_five_point_wrapper(r#"{"fivePointJson":"[]"}"#).is_err()); }
+
+    /// iOS 7.4.0 五点实体 lat/lon 恒 0，真实坐标在 glat/glon —— 校验必须放行。
+    #[test]
+    fn accepts_ios_five_point_with_zero_latlon() {
+        let pts = r#"[{"id":1,"flag":1,"isPass":true,"lat":0,"lon":0,"glat":"22.411344","glon":"112.941001","position":999,"isFixed":0,"pointName":"p1"}]"#;
+        let wrapper = json!({"useZip": false, "fivePointJson": pts, "runAreaId": -1, "geoFencesJson": "[]", "freedomShowFence": false}).to_string();
+        assert!(validate_five_point_wrapper(&wrapper).is_ok());
+        // glat/glon 双零仍拒绝
+        let bad = r#"[{"id":1,"lat":0,"lon":0,"glat":"0","glon":"0"}]"#;
+        let wrapper2 = json!({"useZip": false, "fivePointJson": bad, "runAreaId": -1}).to_string();
+        assert!(validate_five_point_wrapper(&wrapper2).is_err());
+    }
+
+    #[test]
+    fn five_point_payload_handles_string_number_and_fixed_flags() {
+        let input = vec![
+            json!({"glat": "22.411344", "glon": 112.941001, "isFixed": true}),
+            json!({"glat": 22.5, "glon": "112.5", "isFixed": false}),
+            json!({"glat": 22.5, "glon": 112.5, "isFixed": 1}),
+            json!({"glat": 22.5, "glon": 112.5, "isFixed": 0}),
+        ];
+        let payload = five_point_payload(&input, 123);
+        assert_eq!(payload[0]["glat"], "22.411344");
+        assert_eq!(payload[0]["glon"], "112.941001");
+        assert_eq!(payload.iter().map(|p| p["isFixed"].as_bool().unwrap()).collect::<Vec<_>>(),
+                   vec![true, false, true, false]);
+        assert!(validate_five_point_wrapper(&five_point_wrapper(&input, 123)).is_ok());
+        let numeric = json!({"fivePointJson": json!([{"glat": 22.5, "glon": 112.5}]).to_string()}).to_string();
+        assert!(validate_five_point_wrapper(&numeric).is_ok());
+    }
+
+    #[test]
+    fn rejects_missing_malformed_nonfinite_out_of_range_and_zero_coordinates() {
+        let invalid = vec![json!({}), json!({"glat": "bad", "glon": 112}),
+            json!({"glat": "NaN", "glon": 112}), json!({"glat": "inf", "glon": 112}),
+            json!({"glat": 91, "glon": 112}), json!({"glat": 22, "glon": -181}),
+            json!({"glat": 0, "glon": 0}), json!({"glat": null, "glon": 112})];
+        for p in invalid {
+            let direct = json!({"fivePointJson": json!([p.clone()]).to_string()}).to_string();
+            assert!(validate_five_point_wrapper(&direct).is_err(), "{p}");
+            assert!(validate_five_point_wrapper(&five_point_wrapper(&[p.clone()], 123)).is_err(), "{p}");
+        }
+        let good = json!({"glat": 0, "glon": 112});
+        assert!(validate_five_point_wrapper(&five_point_wrapper(&[good], 123)).is_ok());
+    }
 
     #[test]
     fn laps_are_rebuilt_from_overridden_altitude() {
@@ -155,44 +194,38 @@ mod validation_tests {
 
 /// 10s 时间窗，id=(rrid%100000)*1000+窗口序秒（6 个真人样本跨 9 月记录验证一致；
 /// 旧版 App 样本为全局序号，不适用当前版本）。
-fn build_windows(track: &Track, rrid: i64) -> (Vec<Value>, Vec<Value>) {
+/// 10s 时间窗（iOS 7.4.0 _buildStepAndSpeedInfo map 块，各 5 键）：
+/// speed={beginTime,endTime,distance:"%.2f",queueNum:0,state:0}
+/// step={beginTime,endTime,stepsNum,queueNum:0,state:0}
+fn build_windows(track: &Track, _rrid: i64) -> (Vec<Value>, Vec<Value>) {
     let start_ms = track.startTime;
     let total_time = track.totalTime;
     let mut sp = Vec::new();
     let mut stf = Vec::new();
-    for (i, a) in track.speedPerTenSec.iter().enumerate() {
-        let b = &track.stepsPerTenSec[i];
-        let lo = (i * 10) as i64;
-        let hi = (i * 10 + 10) as i64;
-        let hi = hi.min(total_time);
-        let id = (rrid % 100000) * 1000 + hi;
+    let mut lo = 0i64;
+    for (a, b) in track.speedPerTenSec.iter().zip(&track.stepsPerTenSec) {
+        let hi = (lo + a.time).min(total_time);
         sp.push(json!({
             "beginTime": start_ms + lo * 1000,
-            "distance": a.value,
             "endTime": start_ms + hi * 1000,
-            "flag": start_ms,
-            "id": id,
+            "distance": format!("{:.2}", a.value),
             "queueNum": 0,
             "state": 0,
         }));
         stf.push(json!({
-            "avgDiff": 0.0,
             "beginTime": start_ms + lo * 1000,
             "endTime": start_ms + hi * 1000,
-            "flag": start_ms,
-            "id": id,
-            "maxDiff": 0.0,
-            "minDiff": 1000.0,
+            "stepsNum": b.value as i64,
             "queueNum": 0,
             "state": 0,
-            "stepsNum": b.value as i64,
         }));
+        lo = hi;
     }
     (sp, stf)
 }
 
 /// 圈（每 1000m 一圈，末圈 isFullLap=false；avgStride 单位厘米）。
-fn build_laps(track: &Track, start_ms: i64) -> Vec<Value> {
+fn build_laps(track: &Track, _start_ms: i64) -> Vec<Value> {
     let mut laps = Vec::new();
     let locs = &track.locations;
     let (mut prev_d, mut prev_t, mut prev_steps, mut gain) = (0.0f64, 0i64, 0i64, 0.0f64);
@@ -211,21 +244,19 @@ fn build_laps(track: &Track, start_ms: i64) -> Vec<Value> {
             let lap_d = d_now - prev_d;
             let lap_t = 1i64.max(t_now - prev_t);
             let lap_steps = pt.steps - prev_steps;
+            // iOS 7.4.0 _buildLapsInfo：11 键，无 flag/id/step；数值为 NSNumber（double/int）
             laps.push(json!({
-                "avgCadence": round_to(lap_steps as f64 / (lap_t as f64 / 60.0), 2),
-                "avgPace": round_to((lap_t as f64 / 60.0) / (lap_d / 1000.0).max(0.001), 2),
-                "avgStride": round_to(lap_d / 1.max(lap_steps) as f64 * 100.0, 2),
-                "cumulativeDuration": t_now,
+                "lapIndex": laps.len() as i64 + 1,
                 "distance": round_to(lap_d, 4),
                 "duration": lap_t,
-                "elevationGain": round_to(gain, 2),
+                "cumulativeDuration": t_now,
+                "avgPace": round_to((lap_t as f64 / 60.0) / (lap_d / 1000.0).max(0.001), 2),
+                "avgCadence": round_to(lap_steps as f64 / (lap_t as f64 / 60.0), 2),
+                "avgStride": round_to(lap_d / 1.max(lap_steps) as f64 * 100.0, 2),
                 "endAltAbs": round_to(pt.bdA, 2),
                 "endAltRel": round_to(pt.bdA - alt0, 2),
-                "flag": start_ms,
-                "id": laps.len() as i64 + 1,
+                "elevationGain": round_to(gain, 2),
                 "isFullLap": lap_d >= 1000.0,
-                "lapIndex": laps.len() as i64 + 1,
-                "step": lap_steps,
             }));
             prev_d = d_now;
             prev_t = t_now;
@@ -268,6 +299,8 @@ pub fn build_obs_object(
         "step_freq_json": gz_json(&Value::Array(stf)),
         "laps_json": gz_json(&Value::Array(laps)),
         "runFaceCheck": gz_str(""),
+        // 7.4.0 新增：无照片时为空串；有照片时 {"hasRejectedPhoto":bool}
+        "extension_json": gz_str(""),
     })
 }
 

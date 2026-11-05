@@ -5,7 +5,7 @@ use super::{mobile, theme, App};
 use crate::crypto::header::HeaderIdentity;
 use eframe::egui;
 
-const IOS_OS_POOL: [&str; 5] = ["17.5.1", "18.0.1", "18.1", "18.2", "26.5.2"];
+const IOS_OS_POOL: [&str; 7] = ["17.5.1", "18.0.1", "18.1", "18.2", "18.3.1", "18.5", "26.5.2"];
 const ANDROID_MODEL_POOL: [&str; 8] = [
     "22081212C", "OPPO PGBM10", "Redmi K60", "HUAWEI Mate 40", "vivo V2309A",
     "Pixel 8", "SM-S9210", "OnePlus ACE3",
@@ -235,8 +235,13 @@ fn randomize(buf: &mut HeaderIdentity, platform: &str) {
         buf.platform = "android".into();
     } else {
         let k = (rand::random::<f64>() * IOS_OS_POOL.len() as f64) as usize % IOS_OS_POOL.len();
-        buf.device_name = "iPhone".into();
+        // 整套抽取真机档位：营销名 + 逻辑/物理分辨率（全部 3x，与 UA Scale/3.00 一致）
+        let pool = &crate::crypto::header::IOS_DEVICE_POOL;
+        let p = pool[(rand::random::<f64>() * pool.len() as f64) as usize % pool.len()];
+        buf.device_name = p.0.into();
         buf.os_version = IOS_OS_POOL[k].into();
+        buf.logic_pixel = p.1.into();
+        buf.physic_pixel = p.2.into();
         buf.idfa = uuid::Uuid::new_v4().to_string().to_uppercase();
         buf.platform = "ios".into();
     }
