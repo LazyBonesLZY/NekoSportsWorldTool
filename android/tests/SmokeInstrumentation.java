@@ -17,11 +17,11 @@ import org.nekosportsworld.tool.MainActivity;
 public final class SmokeInstrumentation extends Instrumentation {
     private Throwable failure;
     private int passed;
-    private boolean verifyStoredBrand;
+    private boolean verifyRestart;
 
     @Override public void onCreate(Bundle arguments) {
         super.onCreate(arguments);
-        verifyStoredBrand = arguments != null && "true".equals(arguments.getString("verifyStoredBrand"));
+        verifyRestart = arguments != null && "true".equals(arguments.getString("verifyRestart"));
         start();
     }
 
@@ -81,67 +81,45 @@ public final class SmokeInstrumentation extends Instrumentation {
     @Override public void onStart() {
         Bundle report = new Bundle();
         try {
-            if (verifyStoredBrand) {
+            if (verifyRestart) {
                 // A second instrumentation invocation starts a fresh app process.
                 org.json.JSONObject before = readIdentity(getTargetContext());
-                check(android.os.Build.MANUFACTURER.equals(before.getString("manufacturer")), "previous process persisted the real brand");
+                check("ios".equals(before.getString("platform")), "identity stays iOS-only across processes");
+                String uuid = before.getString("device_id");
+                String idfa = before.getString("idfa");
+                check(!idfa.isEmpty(), "IDFA is persisted, not re-derived per launch");
                 Intent restart = new Intent().setClassName("org.nekosportsworld.tool", "org.nekosportsworld.tool.MainActivity");
                 restart.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                 MainActivity restarted = (MainActivity) startActivitySync(restart);
                 awaitUi(restarted::hasWindowFocus, "fresh process window focus");
-                check(dialog(restarted, "deviceInfoDialog") == null, "fresh process must retain the consent choice");
                 org.json.JSONObject after = readIdentity(restarted);
+                check(uuid.equals(after.getString("device_id")), "DeviceId survives a fresh process");
+                check(idfa.equals(after.getString("idfa")), "IDFA survives a fresh process");
                 check(before.toString().equals(after.toString()), "process restart must retain the complete saved identity");
-                check(android.os.Build.MANUFACTURER.equals(after.getString("manufacturer")), "brand retained across process restart");
                 report.putString("stream", "PASS: " + passed + " Android persistence restart checks\n");
                 finish(Activity.RESULT_OK, report);
                 return;
             }
             // The runner only targets an explicitly named emulator. Reset this fixture
-            // so denial, first-run consent and UUID reuse are exercised on every run.
-            getTargetContext().getSharedPreferences("device_info", 0).edit().clear().commit();
-            java.nio.file.Files.deleteIfExists(new java.io.File(getTargetContext().getFilesDir(), "identity.json").toPath());
+            // so first-run identity creation and UUID reuse are exercised on every run.
+            java.nio.file.Files.deleteIfExists(
+                new java.io.File(getTargetContext().getFilesDir(), "identity.json").toPath());
             Intent launch = new Intent().setClassName("org.nekosportsworld.tool", "org.nekosportsworld.tool.MainActivity");
             launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             MainActivity activity = (MainActivity) startActivitySync(launch);
             waitForIdleSync();
             java.io.File initialIdentityFile = new java.io.File(activity.getFilesDir(), "identity.json");
-            awaitUi(() -> identityHas(activity, "platform", "android"), "initial Android identity persistence");
+            awaitUi(() -> identityHas(activity, "platform", "ios"), "initial iOS identity persistence");
             org.json.JSONObject initialIdentity = new org.json.JSONObject(new String(
                 java.nio.file.Files.readAllBytes(initialIdentityFile.toPath()), java.nio.charset.StandardCharsets.UTF_8));
-            check("android".equals(initialIdentity.getString("platform")), "fresh Android install must use Android identity");
+            check("ios".equals(initialIdentity.getString("platform")), "fresh install must use the iOS identity");
             String originalUuid = initialIdentity.getString("device_id");
             check(java.util.UUID.fromString(originalUuid) != null, "DeviceId remains an application UUID");
-            awaitUi(() -> dialog(activity, "deviceInfoDialog") != null, "first-run device information consent");
-            check("Android".equals(initialIdentity.getString("device_name")), "real model must not be read into identity before consent");
-            check(initialIdentity.optString("manufacturer").isEmpty(), "brand must stay empty before consent");
-            onUi(() -> dialog(activity, "deviceInfoDialog").getButton(AlertDialog.BUTTON_NEGATIVE).performClick());
-            awaitUi(() -> dialog(activity, "deviceInfoDialog") == null, "device information denial");
-            check(readIdentity(activity).toString().equals(initialIdentity.toString()), "denial must leave identity unchanged");
-            onUi(() -> {
-                activity.requestDeviceInfo(true);
-                check(dialog(activity, "deviceInfoDialog") == null, "first-run refusal must be remembered");
-                activity.requestDeviceInfo(false);
-                check(dialog(activity, "deviceInfoDialog") != null, "device page can request consent after refusal");
-                dialog(activity, "deviceInfoDialog").cancel();
-            });
-            awaitUi(() -> dialog(activity, "deviceInfoDialog") == null, "manual request cancellation");
-            check(readIdentity(activity).toString().equals(initialIdentity.toString()), "cancelling manual import must preserve identity");
-            onUi(() -> {
-                activity.getSharedPreferences("device_info", 0).edit().clear().commit();
-                activity.requestDeviceInfo(true);
-                dialog(activity, "deviceInfoDialog").getButton(AlertDialog.BUTTON_POSITIVE).performClick();
-            });
-            awaitUi(() -> identityHas(activity, "device_name", android.os.Build.MODEL), "accepted device information saved through Rust JNI bridge");
-            org.json.JSONObject accepted = readIdentity(activity);
-            check(android.os.Build.MANUFACTURER.equals(accepted.getString("manufacturer")), "real brand must be persisted after consent");
-            check(android.os.Build.VERSION.RELEASE.equals(accepted.getString("os_version")), "real Android version imported");
-            check(originalUuid.equals(accepted.getString("device_id")), "consenting must preserve the original UUID");
-            for (String field : new String[]{"idfa", "mac_address", "app_install_time", "city", "anchor_lat", "anchor_lon"}) {
-                check(accepted.get(field).equals(initialIdentity.get(field)), "import must preserve " + field);
-            }
-            awaitUi(() -> dialog(activity, "deviceInfoDialog") == null, "consent dialog dismissal");
-            awaitUi(() -> activity.hasWindowFocus(), "native activity window focus");
+            check(!initialIdentity.optString("idfa").isEmpty(), "IDFA is generated once and persisted");
+            check(!initialIdentity.optString("device_name").isEmpty(), "device page carries an iPhone model name");
+            check(!initialIdentity.optString("logic_pixel").isEmpty()
+                && !initialIdentity.optString("physic_pixel").isEmpty(), "display pixels are persisted");
+            awaitUi(activity::hasWindowFocus, "native activity window focus");
             onUi(() -> {
                 check(activity.getFilesDir().isDirectory(), "private storage directory");
                 check((activity.getWindow().getAttributes().flags & WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) == 0, "idle must permit screen timeout");
@@ -202,9 +180,8 @@ public final class SmokeInstrumentation extends Instrumentation {
             MainActivity reopened = (MainActivity) startActivitySync(launch);
             awaitUi(reopened::hasWindowFocus, "reopened activity window focus");
             check(originalUuid.equals(readIdentity(reopened).getString("device_id")), "reopening must reuse UUID");
-            check(android.os.Build.MANUFACTURER.equals(readIdentity(reopened).getString("manufacturer")), "reopening must retain the saved brand");
+            check(initialIdentity.optString("idfa").equals(readIdentity(reopened).optString("idfa")), "reopening must reuse IDFA");
             onUi(() -> {
-                check(dialog(reopened, "deviceInfoDialog") == null, "consent must not repeat after reopening");
                 check(reopened != activity, "a new Activity can start in the same process");
                 reopened.openEditor(904, "reopened", 0);
                 check(editor(reopened) != null, "editor usable after reopening");
@@ -217,37 +194,14 @@ public final class SmokeInstrumentation extends Instrumentation {
             removeMonitor(monitor);
             check(recreated != null && recreated != reopened, "Activity recreation completes");
             awaitUi(recreated::hasWindowFocus, "recreated activity window focus");
-            check(android.os.Build.MANUFACTURER.equals(readIdentity(recreated).getString("manufacturer")), "Activity recreation must retain the saved brand");
+            check(originalUuid.equals(readIdentity(recreated).getString("device_id")), "Activity recreation must retain the device UUID");
+            check(initialIdentity.optString("idfa").equals(readIdentity(recreated).optString("idfa")), "Activity recreation must retain the IDFA");
             onUi(() -> {
                 recreated.openEditor(905, "recreated", 0);
                 check(editor(recreated) != null, "editor usable after Activity recreation");
                 editor(recreated).cancel();
             });
             awaitUi(() -> editor(recreated) == null, "last editor cancellation");
-            org.json.JSONObject pendingIdentity = readIdentity(recreated);
-            pendingIdentity.put("device_name", "Pending test import");
-            java.nio.file.Files.write(new java.io.File(recreated.getFilesDir(), "identity.json").toPath(),
-                pendingIdentity.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            onUi(() -> {
-                recreated.getSharedPreferences("device_info", 0).edit().clear().commit();
-                recreated.requestDeviceInfo(true);
-                dialog(recreated, "deviceInfoDialog").getButton(AlertDialog.BUTTON_POSITIVE).performClick();
-                recreated.finish();
-            });
-            awaitUi(recreated::isDestroyed, "immediate exit after consent");
-            MainActivity recovered = (MainActivity) startActivitySync(launch);
-            awaitUi(() -> dialog(recovered, "deviceInfoDialog") != null
-                || identityHas(recovered, "device_name", android.os.Build.MODEL), "saved import or renewed consent after immediate exit");
-            onUi(() -> {
-                AlertDialog consent = dialog(recovered, "deviceInfoDialog");
-                if (consent != null) consent.getButton(AlertDialog.BUTTON_POSITIVE).performClick();
-            });
-            awaitUi(() -> identityHas(recovered, "device_name", android.os.Build.MODEL), "recovered import persistence");
-            check(android.os.Build.MODEL.equals(readIdentity(recovered).getString("device_name")), "immediate exit must not permanently lose accepted information");
-            check(originalUuid.equals(readIdentity(recovered).getString("device_id")), "consent recovery must preserve UUID");
-            check(android.os.Build.MANUFACTURER.equals(readIdentity(recovered).getString("manufacturer")), "consent recovery must preserve brand");
-            awaitUi(() -> recovered.getSharedPreferences("device_info", 0).getBoolean("asked", false), "persisted consent acknowledgement");
-            check(true, "consent completion is recorded after identity persistence");
             report.putString("stream", "PASS: " + passed + " Android integration checks\n");
             finish(Activity.RESULT_OK, report);
         } catch (Throwable error) {

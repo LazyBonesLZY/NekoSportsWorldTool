@@ -21,27 +21,29 @@ pub struct RankRow {
 }
 
 /// 主榜参数：rtype=1个人 2班级 3院系；sort=1日榜 2月榜；
-/// date 来自登录态 UserInfo（YYYY-MM-DD），缺省取当天；gender 协议必带，缺省 1。
+/// 主榜（`/api/v41/rank`）。
+///
+/// IPA 的构造块 `sub_1000F10D8` 写的是：`unid`（NSString）+ `type` + `sortType`，
+/// `date` **仅当传入时间戳 ≥ 1 时**才以 `yyyy-MM-dd` 附加。**没有 `gender`**。
+/// 早前实现多发了一个 `gender`，并在缺省时强行塞当天 `date`，两处都已按 IPA 改掉。
 pub fn main_rank(
     client: &mut ApiClient,
     rtype: i64,
     sort_type: i64,
-    gender: Option<i64>,
     date: Option<String>,
 ) -> Result<Vec<RankRow>, String> {
-    let unid = unid_of(client);
-    let date = date.unwrap_or_else(|| {
-        chrono::Local::now().format("%Y-%m-%d").to_string()
-    });
-    let body = json!({
-        "unid": unid,
+    let mut body = json!({
+        "unid": unid_of(client),
         "type": rtype,
         "sortType": sort_type,
-        "date": date,
-        "gender": gender.unwrap_or(1),
     });
+    if let Some(d) = date {
+        if !d.is_empty() {
+            body["date"] = json!(d);
+        }
+    }
     let biz = client.call_host(DISCOVERY, "POST", RANK_PATH, &body.to_string(), &[])?;
-    dump_unknown(&biz, "");
+    dump_unknown(&biz, "rank_main");
     Ok(rows_from(parse_data(&biz)))
 }
 
@@ -55,11 +57,14 @@ pub fn history_rank(client: &mut ApiClient, sort_type: i64, gender: i64) -> Resu
         "pageSize": 20,
     });
     let biz = client.call_host(DISCOVERY, "POST", HISTORY_PATH, &body.to_string(), &[])?;
-    dump_unknown(&biz, "");
+    dump_unknown(&biz, "rank_history");
     Ok(rows_from(parse_data(&biz)))
 }
 
 /// 室内榜：range=1日 2周 3月。
+///
+/// IPA 的 builder `sub_1003B4DC8` 只 setURL + setParameters，**没有** setHTTPMethod:，
+/// 而 `SWRequest._HTTPMethod` 默认 0 → GET（参数进查询串、不做信封加密）。
 pub fn indoor_rank(client: &mut ApiClient, date_range: i64, gender: i64) -> Result<Vec<RankRow>, String> {
     let body = json!({
         "pageNum": 1,
@@ -67,13 +72,14 @@ pub fn indoor_rank(client: &mut ApiClient, date_range: i64, gender: i64) -> Resu
         "gender": gender,
         "dateRange": date_range,
     });
-    let biz = client.call_host(DISCOVERY, "POST", INDOOR_PATH, &body.to_string(), &[])?;
-    dump_unknown(&biz, "");
+    let biz = client.call_host(DISCOVERY, "GET", INDOOR_PATH, &body.to_string(), &[])?;
+    dump_unknown(&biz, "rank_indoor");
     Ok(rows_from(parse_data(&biz)))
 }
 
-fn unid_of(client: &ApiClient) -> i64 {
-    client.login.as_ref().map(|s| s.unid.parse().unwrap_or(0)).unwrap_or(0)
+/// IPA 的 `getUNID` 返回 NSString，三个榜单 body 里的 unid 都必须是字符串。
+fn unid_of(client: &ApiClient) -> String {
+    client.login.as_ref().map(|s| s.unid.clone()).unwrap_or_default()
 }
 
 /// data 可能是数组或 {list:[...]} 包裹。

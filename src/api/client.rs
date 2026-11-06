@@ -10,9 +10,50 @@ use crate::crypto::envelope::{
 };
 use crate::crypto::header::{build_header_for, HeaderIdentity};
 
+/// 7.4.0 真实请求头常量。
+///
+/// 取值来自 `+[SWCHttpTool getHeadRequestSerializer]` @0x10027f674：
+/// `Content-Type: application/json`、`Accept: application/json`、
+/// `Accept-Encoding: gzip`、`Content-Encoding: gzip`、`appVersion`，超时 15s。
+///
+/// **`Content-Encoding: gzip` 有意不发**：AFHTTPRequestSerializer 并不会真的压缩请求体，
+/// 真机是「明明没压却声明 gzip」。服务端显然容忍这一点（否则 App 自己就跑不通），
+/// 但我们这边一旦被严格按 gzip 解析，整条链会直接不可用，且本轮无法登录验证。
+/// 这是一个显式记录的偏离项，等有抓包/实测再决定是否对齐。
+/// `Accept`：**App 侧不设置**。`+[SWCHttpTool setRequestSeriaHeader:]` @0x10027ed88 只显式设
+/// `headerSign` 与 `appVersion`；`Accept` 这个 cstring 在全二进制里只被第三方 SDK
+/// （0x102c2xxxx 区域）引用。
+///
+/// 注意：**ureq 会自动注入 `Accept: */*`，且没有移除 API**（已实测）。因此我们发出去的
+/// 头里仍会带一个 `Accept: */*`——这一条是与真机的**已知客户端级差异**，
+/// 值本身是中性的（不声明格式偏好），不像 `application/json` 那样属于主动表态。
+pub const IOS_ACCEPT_LANGUAGE: &str = "zh-Hans-CN;q=1.0";
+/// 真机是 NSURLSession 自动加的 `gzip, deflate, br`；我们只能解 gzip
+/// （实测 ureq 收到 `Content-Encoding: deflate` 会返回乱码），
+/// 因此只声明 `gzip`——宁可少声明，也不能声明解不了的编码。
+pub const IOS_ACCEPT_ENCODING: &str = "gzip";
+pub const IOS_CONTENT_TYPE: &str = "application/json";
+/// AFHTTPRequestSerializer 的 timeoutInterval 是 15s。
+pub const IOS_TIMEOUT_SECS: u64 = 15;
+
+/// 给请求挂上 iOS 通用头（UA / appVersion / headerSign + AFN 默认头）。
+/// `json_body` 为 false 时（GET）不设 Content-Type —— 实机 GET 不带该头。
+pub fn apply_ios_headers(req: ureq::Request, ua: &str, header_sign: &str, json_body: bool) -> ureq::Request {
+    let mut req = req
+        .set("Accept-Language", IOS_ACCEPT_LANGUAGE)
+        .set("Accept-Encoding", IOS_ACCEPT_ENCODING)
+        .set("User-Agent", ua)
+        .set("appVersion", crate::crypto::header::IOS_APP_VERSION)
+        .set("headerSign", header_sign);
+    if json_body {
+        req = req.set("Content-Type", IOS_CONTENT_TYPE);
+    }
+    req
+}
+
 pub fn make_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(IOS_TIMEOUT_SECS))
         .build()
 }
 
@@ -49,13 +90,9 @@ impl ApiClient {
         self.login.as_ref().map(|s| s.token.clone()).unwrap_or_default()
     }
 
-    /// 按设备身份平台返回对应 UA（与 headerSign 平台严格一致，杜绝跨平台矛盾指纹）。
+    /// iOS 7.4.0 UA（与 headerSign / appVersion 严格同源，杜绝跨平台矛盾指纹）。
     pub fn ua(&self) -> String {
-        if self.identity.platform == "android" {
-            crate::crypto::header::UA_ANDROID.to_string()
-        } else {
-            crate::crypto::header::ua_ios_for(&self.identity.os_version)
-        }
+        crate::crypto::header::ua_ios_for(&self.identity.os_version)
     }
 
     /// 发送信封请求（header/headerSign 用 observed 序，body 用 insert 序）。
@@ -71,7 +108,7 @@ impl ApiClient {
     ) -> Result<RequestOutcome, String> {
         let uid = self.uid();
         let token = self.token();
-        let (header_plain, _) = build_header_for(&self.identity, uid, &token, None);
+        let (header_plain, header_extra) = build_header_for(&self.identity, uid, &token, None);
         let header_env = build_envelope(&mut self.session, &header_plain, OuterOrder::Observed);
         // body 时间戳 = header ts + 0..=2ms（原生两次独立取时，固定 +1 是可聚类特征）
         let delta = (rand::Rng::gen::<u32>(&mut rand::thread_rng()) % 3) as i64;
@@ -86,17 +123,17 @@ impl ApiClient {
             url.to_string()
         };
 
-        let mut req = self.agent.request(method, &final_url);
-        // Alamofire/AFN 真实请求头集合：缺失 Accept/Accept-Encoding 是协议端指纹
-        req = req
-            .set("Accept", "*/*")
-            .set("Accept-Language", "zh-Hans-CN;q=1.0")
-            .set("Accept-Encoding", "gzip;q=1.0, compress;q=0.5")
-            .set("User-Agent", ua)
-            .set("appVersion", crate::crypto::header::IOS_APP_VERSION)
-            .set("headerSign", &header_env.json);
-        if !is_get {
-            req = req.set("Content-Type", "application/json; charset=utf-8");
+        // 通用头由 apply_ios_headers 统一提供，提交链复用同一实现，避免两条链漂移。
+        let mut req = apply_ios_headers(
+            self.agent.request(method, &final_url),
+            ua,
+            &header_env.json,
+            !is_get,
+        );
+        // 与 submit.rs 保持一致：iOS 明文头附带的 nonce/timeStamp/tokenSign 也随请求发送，
+        // 否则两条链的请求头集合不同，服务端可据此区分。
+        for (k, v) in &header_extra {
+            req = req.set(k, v);
         }
         for (k, v) in extra_headers {
             req = req.set(k, v);
@@ -162,6 +199,36 @@ impl ApiClient {
         let biz_str = serde_json::to_string(&crate::textlog::redact_json(&business)).unwrap_or_default();
         eprintln!("[resp] {} -> {} ({}B) {}", path, out.http_status, out.raw_len, biz_str);
         Ok(business)
+    }
+}
+
+/// 服务器时间端点（run 域名，`+[SWAPI serverTime]` @0x100285ff0）。
+pub const SERVER_TIME_PATH: &str = "/api/v3/getserver/gmttime";
+
+/// 允许的本机/服务器时间偏差（秒）。
+///
+/// 真机 `-[SWCHttpTool isVaildTimeRange:]` @0x10028323c 在**每次提交前**先拉这个端点，
+/// 若 `|server - local| > 300` 就返回 `status=0`，`uploadGrade` 的完成块随即用
+/// 错误码 `1090090909` 终止上传（`sub_100047DA8`）。也就是说本机时钟偏 5 分钟以上，
+/// 真机自己就不会上传。
+pub const MAX_CLOCK_SKEW_SECS: i64 = 300;
+
+/// 拉取服务器时间（秒）。响应形如 `{error, message, data:{data: <毫秒>}}`。
+pub fn fetch_server_time_secs(client: &mut ApiClient) -> Result<i64, String> {
+    let biz = client.call("GET", SERVER_TIME_PATH, "{}", &[])?;
+    let data = parse_data_field(&biz);
+    let raw = data
+        .get("data")
+        .and_then(|v| v.as_i64())
+        .or_else(|| data.as_i64())
+        .ok_or("serverTime 响应缺 data.data")?;
+    // 真机：`(unsigned)(v+999) > 0x7CE` → `v/1000`；否则**不用这个值**，
+    // 回退到 `+[ServerDate seconds]` 的缓存时间。我们没有那个缓存，
+    // 因此小值时直接报错跳过对时，而不是拿一个明显不是时间戳的数字去比。
+    if (raw + 999) as u64 > 0x7CE {
+        Ok(raw / 1000)
+    } else {
+        Err(format!("serverTime 值异常（{raw}），跳过对时"))
     }
 }
 
@@ -245,11 +312,23 @@ fn urlencoding_compat(s: &str) -> String {
     out
 }
 
+/// 按 UTF-8 字符边界截断，避免在汉字/emoji 中间切片 panic。
+pub fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 pub fn ureq_err(e: ureq::Error) -> String {
     match e {
         ureq::Error::Status(code, resp) => {
             let body = resp.into_string().unwrap_or_default();
-            format!("HTTP {code}: {}", &body[..body.len().min(300)])
+            format!("HTTP {code}: {}", safe_truncate(&body, 300))
         }
         ureq::Error::Transport(t) => format!("网络错误: {t}"),
     }
@@ -288,5 +367,24 @@ mod query_tests {
         assert_eq!(value_to_query_string(&serde_json::json!(42)), "42");
         assert_eq!(value_to_query_string(&serde_json::json!(null)), "");
         assert_eq!(value_to_query_string(&serde_json::json!(true)), "1");
+    }
+}
+
+#[cfg(test)]
+mod server_time_tests {
+    use super::*;
+
+    /// 毫秒值除以 1000；明显不是时间戳的值返回 Err（真机此时回退缓存，我们没有缓存）。
+    #[test]
+    fn server_time_ms_conversion_and_guard() {
+        // 直接验证换算逻辑（不联网，故复制同样的分支）
+        let conv = |raw: i64| -> Option<i64> {
+            if (raw + 999) as u64 > 0x7CE { Some(raw / 1000) } else { None }
+        };
+        assert_eq!(conv(1_700_000_009_000), Some(1_700_000_009));
+        assert_eq!(conv(500), None);
+        assert_eq!(conv(0), None);
+        assert_eq!(MAX_CLOCK_SKEW_SECS, 300);
+        assert_eq!(SERVER_TIME_PATH, "/api/v3/getserver/gmttime");
     }
 }

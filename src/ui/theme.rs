@@ -85,15 +85,16 @@ pub fn apply(ctx: &egui::Context) {
         w.rounding = egui::Rounding::same(6.0);
     }
 
+    // 字号保持不变，颜色由 override_text_color 统一控制。
+    // 内建 TextStyle 在 egui 默认样式里一定存在，但这里不 unwrap——
+    // UI 代码里没有理由为一个"取不到就跳过"的场景中止进程。
     for style_key in [
         egui::TextStyle::Heading,
         egui::TextStyle::Body,
         egui::TextStyle::Button,
         egui::TextStyle::Small,
     ] {
-        let font_id = style.text_styles.get_mut(&style_key).unwrap();
-        // 保持字号不变，只确保颜色由 override_text_color 控制
-        let _ = font_id;
+        let _ = style.text_styles.get_mut(&style_key);
     }
 
     style.spacing.item_spacing = egui::vec2(10.0, 7.0);

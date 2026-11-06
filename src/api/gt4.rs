@@ -13,8 +13,14 @@ use super::gt4image::get_distance_original;
 
 const GEE_HOST: &str = "https://gcaptcha4.geetest.com";
 const STATIC_HOST: &str = "https://static.geetest.com/";
-const UA_WEB: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+/// GT4 跑在 WKWebView 里，UA 必须是 iPhone 形态。
+///
+/// 随包资源 `GTCaptcha4.bundle/gt4.js` 里 `var MOBILE = /Mobi/i.test(navigator.userAgent)`，
+/// 而 `jsonp()` 的 `client_type` 是 `MOBILE ? 'h5' : 'web'`。iOS WKWebView 的默认 UA
+/// 含 `Mobile/`，所以真机 `client_type` 恒为 **h5**。旧实现配桌面 Chrome UA 却声明 `web`，
+/// 自身就矛盾，也是可聚类的指纹。
+const UA_GT4: &str =
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148";
 
 /// jsbn 28bit limb 数组 → RSA 公钥（e=65537）。
 fn gee_rsa_public_key() -> rsa::RsaPublicKey {
@@ -45,9 +51,17 @@ fn get_str_16(rng: &mut impl Rng) -> String {
     (0..4).map(|_| four_random_chart(rng)).collect()
 }
 
-/// 找 nonce（16 个随机 hex 字符）使 sha256(base+nonce) 以 "00" 开头。
-fn get_pow_msg_str_16(pow_msg_base: &str, log: &mut dyn FnMut(&str)) -> String {
+/// 找 nonce（16 个随机 hex 字符）使 sha256(base+nonce) 的前导零满足题目要求。
+///
+/// 前导零个数取自 `pow_detail.bits`（题目参数，`bits` 已经拼进 pow_msg）。
+/// 旧实现写死 `"00"`：若真机 `bits` 不是 2，`/verify` 必然失败并被 3×3 重试放大。
+/// 这里取 `bits` 个 hex 零；无论 `bits` 被解释成「hex 位数」还是「bit 数」，
+/// 多要求几位都仍然满足题意（更严格），因此是安全的。
+fn get_pow_msg_str_16(pow_msg_base: &str, bits: usize, log: &mut dyn FnMut(&str)) -> String {
     const HEX: &[u8] = b"0123456789abcdef";
+    // 成本 16^bits；限制在 1..=6 以免题目异常时卡死（6 个 hex 零平均约 1600 万次）。
+    let zeros = bits.clamp(1, 6);
+    let prefix = "0".repeat(zeros);
     let mut rng = rand::thread_rng();
     let mut attempts = 0u64;
     loop {
@@ -59,8 +73,10 @@ fn get_pow_msg_str_16(pow_msg_base: &str, log: &mut dyn FnMut(&str)) -> String {
         hasher.update(nonce.as_bytes());
         let hash = format!("{:x}", hasher.finalize());
         attempts += 1;
-        if hash.starts_with("00") {
-            log(&format!("[gt4] PoW 找到 nonce（尝试 {attempts} 次）"));
+        if hash.starts_with(&prefix) {
+            log(&format!(
+                "[gt4] PoW 找到 nonce（要求 {zeros} 个前导零，尝试 {attempts} 次）"
+            ));
             return nonce;
         }
     }
@@ -82,7 +98,8 @@ fn get_pow_msg(
         captcha_id,
         lot_number
     );
-    let nonce = get_pow_msg_str_16(&base, log);
+    let bits = pow_detail["bits"].as_u64().unwrap_or(2) as usize;
+    let nonce = get_pow_msg_str_16(&base, bits, log);
     format!("{base}{nonce}")
 }
 
@@ -118,7 +135,22 @@ fn encrypt_data(pub_key: &rsa::RsaPublicKey, plaintext: &str) -> String {
 }
 
 /// w = hex(AES(plaintext)) + hex(RSA(str16))。
-fn get_w(set_left: usize, lot_number: &str, pow_msg: &str, pow_sign: &str, str16: &str) -> String {
+///
+/// `lot_number` 来自服务端，会按固定下标切片（`lf(26,30)` 等）。长度不足或含多字节字符时
+/// 直接 panic（历史实现就是 `&str[a..b]`），因此先校验。
+fn get_w(
+    set_left: usize,
+    lot_number: &str,
+    pow_msg: &str,
+    pow_sign: &str,
+    str16: &str,
+) -> Result<String, String> {
+    if lot_number.len() < 30 || !lot_number.is_ascii() {
+        return Err(format!(
+            "GT4 lot_number 长度/字符集非法（len={}），无法组包 w",
+            lot_number.len()
+        ));
+    }
     let pk = gee_rsa_public_key();
     let userresponse = set_left as f64 / 1.005_946_666_666_666_5 + 2.0;
     let lf = |a: usize, b: usize| lot_number[a..b].to_string();
@@ -134,7 +166,7 @@ fn get_w(set_left: usize, lot_number: &str, pow_msg: &str, pow_sign: &str, str16
     );
     let r = encrypt_data(&pk, str16);
     let i = aes_o(&plaintext, str16);
-    i + &r
+    Ok(i + &r)
 }
 
 fn jsonp_value(text: &str) -> Result<Value, String> {
@@ -175,12 +207,12 @@ fn solve_once(
     let challenge = uuid::Uuid::new_v4().to_string().replace('-', "");
     let callback = format!("geetest_{}", crate::crypto::envelope::now_ms());
     let load_url = format!(
-        "{GEE_HOST}/load?callback={cb}&captcha_id={cid}&challenge={ch}&client_type=web&risk_type=slide&lang=zh",
+        "{GEE_HOST}/load?callback={cb}&captcha_id={cid}&challenge={ch}&client_type=h5&risk_type=slide&lang=zh",
         cb = callback,
         cid = captcha_id,
         ch = challenge
     );
-    let resp = agent.get(&load_url).set("User-Agent", UA_WEB).call().map_err(ureq_err)?;
+    let resp = agent.get(&load_url).set("User-Agent", UA_GT4).call().map_err(ureq_err)?;
     let text = resp.into_string().map_err(|e| e.to_string())?;
     let data = jsonp_value(&text)?["data"]
         .as_object()
@@ -207,14 +239,14 @@ fn solve_once(
     // verify
     let cb = format!("geetest_{}", crate::crypto::envelope::now_ms());
     let verify_url = format!(
-        "{GEE_HOST}/verify?callback={cb}&captcha_id={cid}&client_type=web&lot_number={lot}&risk_type=slide&payload={pl}&process_token={pt}&payload_protocol=1&pt=1&w={w}",
+        "{GEE_HOST}/verify?callback={cb}&captcha_id={cid}&client_type=h5&lot_number={lot}&risk_type=slide&payload={pl}&process_token={pt}&payload_protocol=1&pt=1&w={w}",
         cid = captcha_id,
         lot = urlencode(&lot_number),
         pl = urlencode(&payload),
         pt = urlencode(&process_token),
-        w = urlencode(&w),
+        w = urlencode(&w?),
     );
-    let resp = agent.get(&verify_url).set("User-Agent", UA_WEB).call().map_err(ureq_err)?;
+    let resp = agent.get(&verify_url).set("User-Agent", UA_GT4).call().map_err(ureq_err)?;
     let text = resp.into_string().map_err(|e| e.to_string())?;
     let root = jsonp_value(&text)?;
     if root["status"].as_str() != Some("success") {
@@ -230,7 +262,7 @@ fn solve_once(
 }
 
 fn download(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>, String> {
-    let resp = agent.get(url).set("User-Agent", UA_WEB).call().map_err(ureq_err)?;
+    let resp = agent.get(url).set("User-Agent", UA_GT4).call().map_err(ureq_err)?;
     let mut buf = Vec::new();
     std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf).map_err(|e| e.to_string())?;
     Ok(buf)
@@ -273,13 +305,15 @@ mod tests {
     /// get_pow_msg 拼接 + pow_sign。
     #[test]
     fn test_pow_msg_and_sign() {
+        // 测试里用 bits=2（约 256 次尝试）；生产按服务端给的 bits 走。
+        // 用 5 会让未优化构建跑约 100 万次 sha256，单测要几十秒。
         let detail = json!({
-            "version": "v1", "bits": 5, "hashfunc": "sha256",
+            "version": "v1", "bits": 2, "hashfunc": "sha256",
             "datetime": "2026-09-09T00:00:00"
         });
         let mut logf = |_s: &str| {};
         let msg = get_pow_msg(&detail, "cid123", "lot456", &mut logf);
-        assert!(msg.starts_with("v1|5|sha256|2026-09-09T00:00:00|cid123|lot456||"));
+        assert!(msg.starts_with("v1|2|sha256|2026-09-09T00:00:00|cid123|lot456||"));
         assert_eq!(msg.len() - msg.rfind('|').unwrap() - 1, 16);
         let sign = get_pow_sign(&msg);
         assert_eq!(sign.len(), 64);
@@ -289,13 +323,39 @@ mod tests {
         assert_eq!(format!("{:x}", h.finalize()), sign);
     }
 
+    /// 前导零个数必须来自 `pow_detail.bits`，不能写死。
+    #[test]
+    fn test_pow_bits_is_honoured() {
+        let mut logf = |_s: &str| {};
+        for bits in 1u64..=3 {
+            let detail = json!({"version": "v1", "bits": bits, "hashfunc": "sha256",
+                                "datetime": "2026-09-09T00:00:00"});
+            let msg = get_pow_msg(&detail, "cid", "lot", &mut logf);
+            let sign = get_pow_sign(&msg);
+            let need = "0".repeat(bits as usize);
+            assert!(sign.starts_with(&need), "bits={bits} 时 hash={sign} 应满足前导 {need}");
+        }
+    }
+
     /// w 参数：格式 = aes_hex + rsa_hex，长度 = 32 字节块 + key 块。
     #[test]
     fn test_get_w_shape() {
         let lot = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
-        let w = get_w(123, lot, "pow|msg||nonce1234567890ab", "sign", "0123456789abcdef");
+        let w = get_w(123, lot, "pow|msg||nonce1234567890ab", "sign", "0123456789abcdef")
+            .expect("合法 lot_number 应能组包");
         // AES 输出 ≥32 hex + RSA 130 字节 = 260 hex（key≈1036bit）
         assert!(w.len() > 260, "w len={}", w.len());
         assert!(w.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// lot_number 非法时必须返回 Err，不能切片 panic。
+    #[test]
+    fn test_get_w_rejects_short_or_non_ascii_lot() {
+        for bad in ["", "abc", "短中文lot"] {
+            assert!(
+                get_w(1, bad, "m", "s", "0123456789abcdef").is_err(),
+                "lot={bad:?} 应被拒绝"
+            );
+        }
     }
 }

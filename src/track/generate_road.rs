@@ -13,7 +13,7 @@ use super::geom::{
     fmt_gain_time, ring_point_at, round_to, to_bd, wgs84_to_bd09, Rng, MET_PER_DEG_LAT,
     m_per_deg_lng,
 };
-use super::model::{GenPoint, Segment, Track};
+use super::model::{GenPoint, Track};
 use super::postfix::apply_post_fixes;
 use route_planner::{
     fatigue_from_km, gait, ou_cadence_series, pace_profile, plan_route_split, point_in_polygon,
@@ -31,7 +31,8 @@ pub enum RouteMode {
 }
 
 impl RouteMode {
-    pub fn from_str(s: &str) -> Self {
+    /// 配置字符串 → 路线算法（未知值一律回退经典算法）。
+    pub fn parse(s: &str) -> Self {
         match s {
             "road" => RouteMode::Road,
             _ => RouteMode::Legacy,
@@ -206,6 +207,37 @@ pub fn build_road(
     must_bd: &[(f64, f64)],
     net: &RoadGraph,
 ) -> Result<Track, String> {
+    // 两段式标定：先用单位尺度生成并量出真实折线长度，再按 目标/实测 缩放推进量。
+    // 服务端会用 gLat/gLng 重算距离，声明的 totalDis 必须等于折线实长。
+    let target = dist + ROAD_LENGTH_BIAS_M;
+    let mut scale = 1.0f64;
+    let mut out = build_road_scaled(dist, dur, seed, start_ms, route_bd, must_bd, net, scale)?;
+    for _ in 0..4 {
+        if (out.totalDistance - target).abs() <= ROAD_LENGTH_TOLERANCE_M || out.totalDistance < 1.0 {
+            break;
+        }
+        scale = (scale * target / out.totalDistance).clamp(0.2, 5.0);
+        out = build_road_scaled(dist, dur, seed, start_ms, route_bd, must_bd, net, scale)?;
+    }
+    Ok(out)
+}
+
+/// 声明距离与折线实长的对齐容差（米）。
+const ROAD_LENGTH_TOLERANCE_M: f64 = 0.05;
+/// 与经典模式一致的向上偏置：提交层按 `(long)totalDis` 截断，少 0.5 m 会让 1000 m 阈值变成 999。
+const ROAD_LENGTH_BIAS_M: f64 = 0.25;
+
+#[allow(clippy::too_many_arguments)]
+fn build_road_scaled(
+    dist: f64,
+    dur: i64,
+    seed: u64,
+    start_ms: i64,
+    route_bd: &[(f64, f64)],
+    must_bd: &[(f64, f64)],
+    net: &RoadGraph,
+    length_scale: f64,
+) -> Result<Track, String> {
     let mut rng = Rng::new(seed);
     let dur_f = dur as f64;
     let avg_v = dist / dur_f;
@@ -262,36 +294,14 @@ pub fn build_road(
     let speeds: Vec<f64> = w.clone();
     let seg_dist: Vec<f64> = (0..n).map(|i| w[i] * dts[i]).collect();
 
-    // 点位类型（同经典模式）
-    let tl_w = [
-        ((-1i64, 4i64), 54u32),
-        ((-1, 1), 27),
-        ((-1, 12), 13),
-        ((-1, 5), 3),
-        ((-1, 6), 2),
-    ];
+    // 点位类型（同经典模式）：IPA 实证 3=灰 7/10=红 -1=不绘制，只发绿色类型。
     let mut kinds: Vec<(i64, i64)> = Vec::with_capacity(n);
     for _ in 0..n {
         let u = rng.random();
-        if u < 0.39 {
-            kinds.push((3, 1));
-        } else if u < 0.93 {
+        if u < 0.96 {
             kinds.push((0, 1));
-        } else if u < 0.96 {
-            kinds.push(rng.weighted(&tl_w));
         } else {
             kinds.push((rng.choice(&[1, 1, 1, 1, 2, 2]), 1));
-        }
-    }
-    for i in 1..kinds.len() {
-        let prev_drift = (-1 == kinds[i - 1].0) || kinds[i - 1].0 == 5 || kinds[i - 1].0 == 6;
-        if kinds[i].0 != -1 && prev_drift && rng.random() < 0.08 {
-            kinds[i] = (if rng.random() < 0.75 { 7 } else { 8 }, 1);
-        }
-    }
-    for i in 1..n {
-        if kinds[i].0 == -1 && kinds[i - 1].0 == -1 {
-            kinds[i] = (rng.choice(&[3, 0]), 1);
         }
     }
     let normal_idx: Vec<usize> = (0..n).filter(|&i| kinds[i].0 != -1 && i > 1).collect();
@@ -299,7 +309,7 @@ pub fn build_road(
     let share = if share == 0.0 { 1.0 } else { share };
     let mut disp_of = vec![0.0f64; n];
     for &i in &normal_idx {
-        disp_of[i] = seg_dist[i] * (dist / share);
+        disp_of[i] = seg_dist[i] * (dist / share) * length_scale;
     }
 
     // 建筑 SDF（自适应放大漂移）
@@ -334,13 +344,17 @@ pub fn build_road(
     let mut dist_acc = 0.0f64;
     let mut steps_acc = 0.0f64;
     let mut alt = 82.0 + rng.uniform(-1.0, 1.0);
-    let n_est = 1.max((dur_f / 5.0) as i64);
-    let alt_sigma = rng.uniform(3.8, 6.2) / (0.40 * n_est as f64);
-    let mut ten_windows = TenWindowAccumulator::default();
+    // 与经典算法同一模型：目标平稳标准差 1.8~2.8m（见 generator.rs 取证）。
+    const ALT_THETA: f64 = 0.04;
+    let alt_sigma =
+        rng.uniform(1.8, 2.8) * (2.0 * ALT_THETA - ALT_THETA * ALT_THETA).sqrt();
 
     for i in 0..n {
         let dt = dts[i];
         let (typ, lt) = kinds[i];
+        // kinds 只产出 0/1/2，-1（不绘制点）分支在当前生成策略下不可达；
+        // 若将来重新引入暂停/漂移点，这里会先炸出来，避免默默生成灰/红轨迹。
+        debug_assert!(typ != -1, "kinds 不应产出 -1");
         t_acc += dt;
         let pos = |ss: f64| ring_point_at(&dense, &arcs, ss);
         let mut d_step = 0.0f64;
@@ -367,11 +381,13 @@ pub fn build_road(
             let (jxd, jyd) = jitter.step(sc, z);
             px = bx + jxd;
             py = by + jyd;
+            // 真机 radius 是 CLLocation.horizontalAccuracy（户外 3~15m），
+            // 上传前还会做 10 样本滑动中位数（`_smoothAccuracy:`）。
             rad = round_to(
                 if typ == 3 {
-                    rng.uniform(1.4, 5.1)
+                    rng.uniform(8.0, 25.0)
                 } else {
-                    rng.uniform(1.4, 2.4)
+                    rng.uniform(3.2, 12.0)
                 },
                 2,
             );
@@ -452,7 +468,7 @@ pub fn build_road(
             dist_acc += d_step;
         }
         let (lat, lng) = to_bd(px, py, c_lat, c_lng);
-        alt += 0.04 * (82.0 - alt) + rng.gauss(0.0, alt_sigma);
+        alt += ALT_THETA * (82.0 - alt) + rng.gauss(0.0, alt_sigma);
         // 生物力学联动：v=(cad/60)·stride
         let v_now = speeds[i];
         let stride = (v_now * 60.0 / cadences[i]).clamp(0.5, 1.7);
@@ -481,7 +497,6 @@ pub fn build_road(
             (avg, gps)
         };
 
-        ten_windows.add(dt, speeds[i], cad / 60.0);
         locs.push(GenPoint {
             id: i as i64 + 1,
             flag: start_ms,
@@ -508,7 +523,8 @@ pub fn build_road(
             coorType: "gcj02".into(),
             bdA: round_to(alt, 2),
             bdD: round_to(brg, 2),
-            bdS: round_to((avg_sp * rng.uniform(0.6, 0.95)).max(0.0), 3),
+            // 与经典算法一致：bdS 围绕 avgSpeed 波动（0.90~1.10），不是恒低于平均。
+            bdS: round_to((avg_sp * rng.uniform(0.90, 1.10)).max(0.0), 3),
             bdG: rng.choice(&[1, 1, 1, -1]),
             count: rng.randint(20, 88),
             dtr: 0.0,
@@ -516,31 +532,8 @@ pub fn build_road(
             locationId: String::new(),
         });
     }
-    let (ten_speed, ten_steps) = ten_windows.finish();
 
-    let mut segments: Vec<Segment> = Vec::new();
-    let (mut seg_t, mut seg_d) = (0.0f64, 0.0f64);
-    let mut seg_v: Vec<f64> = Vec::new();
-    for i in 0..n {
-        seg_t += dts[i];
-        seg_d += seg_dist[i];
-        seg_v.push(speeds[i]);
-        if seg_t >= 60.0 || i == n - 1 {
-            segments.push(Segment {
-                totalTime: round_to(seg_t, 0) as i64,
-                distance: round_to(seg_d, 0) as i64,
-                startTime: round_to((times[i] - seg_t) * 1000.0, 0) as i64,
-                endTime: round_to(times[i] * 1000.0, 0) as i64,
-                avgSpeed: round_to(seg_v.iter().sum::<f64>() / seg_v.len() as f64, 3),
-                avgStep: round_to(steps_acc / 1.0f64.max(t_acc) * 60.0, 0) as i64,
-                state: 0,
-            });
-            seg_t = 0.0;
-            seg_d = 0.0;
-            seg_v.clear();
-        }
-    }
-
+    super::generator::median_filter_accuracy(&mut locs, 10);
     apply_post_fixes(&mut locs, &mut rng, start_ms);
 
     // 点位吸附：<40m 精确落位（全量打卡点，含必经点与普通打卡点）
@@ -564,20 +557,58 @@ pub fn build_road(
         }
     }
 
-    let total_dis = round_to(dist, 3);
+    // 起点哨兵必须与首点**重合**：两点 `totalTime` 都是 0，若坐标不同，
+    // 折线实长就会多出一段「没有时长的位移」（实测 1.79m），而
+    // `segment_distances` 从索引 2 起算、不计这一段 —— 于是声明的 totalDis 比
+    // 服务端按坐标重算的值小 1.79m。经典模式里两点本来就重合，所以没暴露。
+    if locs.len() > 1 {
+        locs[1].gLat = locs[0].gLat;
+        locs[1].gLng = locs[0].gLng;
+    }
+
+    // ── 距离口径唯一化（与经典模式完全一致）──────────────────────────
+    // totalDis / totalDistance / 十秒窗 / 总步数全部由最终下发的坐标与时间反算，
+    // 保证服务端用 gLat/gLng 重算的结果与声明值一致。
+    if !locs.is_empty() {
+        locs[0].steps = 0;
+    }
+    let gdist = super::generator::segment_distances(&locs);
+    let total_dis = round_to(gdist.iter().sum::<f64>(), 4);
+    let mut acc = 0.0f64;
+    for i in 0..locs.len() {
+        acc += gdist[i];
+        locs[i].totalDis = round_to(acc, 4);
+        locs[i].validDis = round_to(acc, 4);
+    }
+    for i in 2..locs.len() {
+        let dt = (locs[i].totalTime - locs[i - 1].totalTime) as f64;
+        if dt > 0.0 {
+            locs[i].avgSpeed = round_to(gdist[i] / dt, 4);
+        }
+    }
+    let mut ten_windows = TenWindowAccumulator::default();
+    let mut prev_steps = 0i64;
+    for i in 1..locs.len() {
+        let delta = (locs[i].steps - prev_steps).max(0) as f64;
+        prev_steps = locs[i].steps;
+        let dt = (locs[i].totalTime - locs[i - 1].totalTime) as f64;
+        ten_windows.add(dt, gdist[i], delta);
+    }
+    let (ten_speed, ten_steps) = ten_windows.finish();
+    let total_steps = ten_steps.iter().map(|w| w.value).sum::<f64>() as i64;
+    let total_time = locs.last().map(|p| p.totalTime).unwrap_or(0);
     Ok(Track {
-        totalTime: round_to(t_acc, 0) as i64,
+        totalTime: total_time,
         totalDistance: total_dis,
         validDistance: total_dis,
-        validTime: round_to(t_acc, 0) as i64,
+        validTime: total_time,
         startTime: start_ms,
         startLatitude: locs[0].gLat,
         startLongitude: locs[0].gLng,
-        totalSteps: steps_acc as i64,
+        totalSteps: total_steps,
         locations: locs,
         speedPerTenSec: ten_speed,
         stepsPerTenSec: ten_steps,
-        segments,
     })
 }
 

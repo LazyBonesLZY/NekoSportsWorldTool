@@ -263,7 +263,7 @@ fn extract_tar_gz(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut tar = tar::Archive::new(gz);
     let mut best: Option<Vec<u8>> = None;
     let mut entries = tar.entries().map_err(|e| format!("tar 打开失败: {e}"))?;
-    while let Some(entry) = entries.next() {
+    for entry in entries.by_ref() {
         let mut e = entry.map_err(|e| format!("tar 读取失败: {e}"))?;
         if !e.header().entry_type().is_file() {
             continue;
@@ -283,8 +283,46 @@ fn extract_tar_gz(bytes: &[u8]) -> Result<Vec<u8>, String> {
 
 /// 自替换：新二进制落 .new → 当前程序改名 .old（Windows 允许重命名运行中的
 /// exe）→ .new 转正；失败回滚。调用方随后退出，残留 .old 由下次启动清理。
+/// 更新状态记录：只在「替换前版本」与「当前跑着的版本」不同（新版本确实接管了）
+/// 时才允许删掉 `.old` 备份。
+const UPDATE_STATE_FILE: &str = "update_state.json";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct UpdateState {
+    applied_from: String,
+    at_ms: i64,
+}
+
+#[cfg(not(target_os = "android"))]
+fn write_update_state(applied_from: &str) {
+    let state = UpdateState {
+        applied_from: applied_from.to_string(),
+        at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0),
+    };
+    if let Ok(text) = serde_json::to_string(&state) {
+        let _ = std::fs::write(crate::platform::data_dir().join(UPDATE_STATE_FILE), text);
+    }
+}
+
+#[cfg_attr(target_os = "android", allow(dead_code))]
+fn clear_update_state() {
+    let _ = std::fs::remove_file(crate::platform::data_dir().join(UPDATE_STATE_FILE));
+}
+
+/// 换版后是否还要保留 `.old`：记录里的「替换前版本」与当前运行版本相同，
+/// 说明跑的还是旧二进制（更新没生效或用户重启了旧文件），备份必须留着。
+fn keep_old_backup(applied_from: Option<&str>, current: &str) -> bool {
+    matches!(applied_from, Some(from) if from == current)
+}
+
 #[cfg(not(target_os = "android"))]
 pub fn apply(binary: &[u8]) -> Result<(), String> {
+    if binary.is_empty() {
+        return Err("更新包为空（Release 资产损坏或解包失败）".into());
+    }
     let exe = std::env::current_exe().map_err(|e| format!("无法定位自身路径: {e}"))?;
     let dir = exe.parent().ok_or("无法定位 exe 目录")?;
     let file = exe.file_name().and_then(|n| n.to_str()).ok_or("exe 文件名异常")?;
@@ -303,26 +341,50 @@ pub fn apply(binary: &[u8]) -> Result<(), String> {
         std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("设置执行权限失败: {e}"))?;
     }
+    // 先记账再动手：万一进程在替换中途被杀，下次启动也知道 .old 是哪一版。
+    write_update_state(&current_version());
     let _ = std::fs::remove_file(&old);
-    std::fs::rename(&exe, &old).map_err(|e| {
+    if let Err(e) = std::fs::rename(&exe, &old) {
         let _ = std::fs::remove_file(&new);
-        format!("无法移动当前程序（可能被占用）: {e}")
-    })?;
+        clear_update_state();
+        return Err(format!("无法移动当前程序（可能被占用）: {e}"));
+    }
     if let Err(e) = std::fs::rename(&new, &exe) {
-        let _ = std::fs::rename(&old, &exe);
-        return Err(format!("替换程序失败: {e}"));
+        let rollback = std::fs::rename(&old, &exe);
+        return Err(match rollback {
+            Ok(()) => {
+                clear_update_state();
+                format!("替换程序失败: {e}（已回滚到原程序）")
+            }
+            Err(rollback_err) => format!(
+                "替换程序失败: {e}；回滚也失败: {rollback_err}。\n原程序仍保存在 {}，请手动改名回 {} 后再启动",
+                old.display(),
+                file
+            ),
+        });
     }
     Ok(())
 }
 
-/// 清理上次更新残留的 .old/.new（旧进程未退出时会删不掉，静默跳过）。
+/// 清理上次更新残留。
+///
+/// `.new` 是写到一半的垃圾，任何时候都能删；`.old` 是**唯一可回滚的备份**，
+/// 只有确认「新版本已经接管」（记录的替换前版本 ≠ 当前运行版本）才删除，
+/// 否则新版一启动就把备份销毁，坏版本将无法恢复。
 pub fn cleanup_residue() {
     let Ok(exe) = std::env::current_exe() else { return };
     let Some(dir) = exe.parent() else { return };
     let Some(file) = exe.file_name().and_then(|n| n.to_str()) else { return };
-    for suffix in [".old", ".new"] {
-        let _ = std::fs::remove_file(dir.join(format!("{file}{suffix}")));
+    let _ = std::fs::remove_file(dir.join(format!("{file}.new")));
+    let applied_from = std::fs::read_to_string(crate::platform::data_dir().join(UPDATE_STATE_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str::<UpdateState>(&t).ok())
+        .map(|s| s.applied_from);
+    if keep_old_backup(applied_from.as_deref(), &current_version()) {
+        return;
     }
+    let _ = std::fs::remove_file(dir.join(format!("{file}.old")));
+    clear_update_state();
 }
 
 #[cfg(test)]
@@ -344,6 +406,20 @@ mod tests {
         // 位数不同 / 前后空格
         assert!(is_newer("0.2", "v0.2.1"));
         assert!(!is_newer(" 0.2.5 ", "v0.2.5"));
+    }
+
+    /// 备份保留策略：只有「当前版本 ≠ 替换前版本」才允许删 `.old`。
+    #[test]
+    fn old_backup_is_kept_until_new_version_runs() {
+        assert!(keep_old_backup(Some("0.3.0"), "0.3.0"));
+        assert!(!keep_old_backup(Some("0.3.0"), "0.3.1"));
+        assert!(!keep_old_backup(None, "0.3.0"));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn empty_binary_is_rejected() {
+        assert!(apply(&[]).unwrap_err().contains("更新包为空"));
     }
 
     #[test]

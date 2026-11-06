@@ -38,6 +38,6 @@ Invoke-Checked $adb @('-s',$Serial,'shell','wm','dismiss-keyguard')
 $result = & $adb '-s' $Serial 'shell' 'am' 'instrument' '-w' 'org.nekosportsworld.tool.tests/org.nekosportsworld.tool.tests.SmokeInstrumentation'
 $result
 if ($LASTEXITCODE -ne 0 -or ($result -join "`n") -notmatch 'PASS: [0-9]+ Android integration checks') { throw 'Android integration checks failed' }
-$restartResult = & $adb '-s' $Serial 'shell' 'am' 'instrument' '-w' '-e' 'verifyStoredBrand' 'true' 'org.nekosportsworld.tool.tests/org.nekosportsworld.tool.tests.SmokeInstrumentation'
+$restartResult = & $adb '-s' $Serial 'shell' 'am' 'instrument' '-w' '-e' 'verifyRestart' 'true' 'org.nekosportsworld.tool.tests/org.nekosportsworld.tool.tests.SmokeInstrumentation'
 $restartResult
 if ($LASTEXITCODE -ne 0 -or ($restartResult -join "`n") -notmatch 'PASS: [0-9]+ Android persistence restart checks') { throw 'Android process restart persistence checks failed' }

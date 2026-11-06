@@ -11,12 +11,6 @@ static CONTEXT: Mutex<Option<egui::Context>> = Mutex::new(None);
 static EDITS: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
 static SCREEN_ON: AtomicBool = AtomicBool::new(false);
 static SAFE_INSETS: Mutex<[i32; 4]> = Mutex::new([0; 4]);
-static DEVICE_INFO: Mutex<Option<DeviceInfoReply>> = Mutex::new(None);
-
-pub(crate) struct DeviceInfoReply {
-    pub initial: bool,
-    pub result: Result<Option<crate::api::model::DeviceInfo>, String>,
-}
 
 #[no_mangle]
 fn android_main(app: AndroidApp) {
@@ -26,7 +20,6 @@ fn android_main(app: AndroidApp) {
     let _ = DATA_DIR.set(directory);
     *APP.lock().unwrap() = Some(app.clone());
     EDITS.get_or_init(Default::default).lock().unwrap().clear();
-    *DEVICE_INFO.lock().unwrap() = None;
     SCREEN_ON.store(false, Ordering::Relaxed);
     let options = eframe::NativeOptions {
         run_and_return: false,
@@ -102,40 +95,6 @@ pub(crate) fn edit_text(id: u64, value: &str, kind: crate::platform::InputKind) 
 
 pub(crate) fn take_edited_text(id: u64) -> Option<String> {
     EDITS.get_or_init(Default::default).lock().unwrap().remove(&id)
-}
-
-pub(crate) fn request_device_info(initial: bool) {
-    with_activity(|env, activity| {
-        env.call_method(activity, "requestDeviceInfo", "(Z)V", &[JValue::Bool(initial.into())])?;
-        Ok(())
-    });
-}
-
-pub(crate) fn take_device_info() -> Option<DeviceInfoReply> {
-    DEVICE_INFO.lock().unwrap().take()
-}
-
-pub(crate) fn complete_device_info() {
-    with_activity(|env, activity| {
-        env.call_method(activity, "completeDeviceInfo", "()V", &[])?;
-        Ok(())
-    });
-}
-
-#[no_mangle]
-pub extern "system" fn Java_org_nekosportsworld_tool_MainActivity_nativeDeviceInfo(
-    mut env: JNIEnv<'_>, _activity: JObject<'_>, initial: jni::sys::jboolean,
-    info: JString<'_>, error: JString<'_>,
-) {
-    let Ok(info) = env.get_string(&info) else { return };
-    let info: String = info.into();
-    let Ok(error) = env.get_string(&error) else { return };
-    let error: String = error.into();
-    let result = if !error.is_empty() { Err(error) }
-        else if info.is_empty() { Ok(None) }
-        else { serde_json::from_str(&info).map(Some).map_err(|_| "无法解析本机信息，请手动填写".into()) };
-    *DEVICE_INFO.lock().unwrap() = Some(DeviceInfoReply { initial: initial != 0, result });
-    if let Some(context) = CONTEXT.lock().unwrap().as_ref() { context.request_repaint(); }
 }
 
 pub(crate) fn copy_text(text: &str) {

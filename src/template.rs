@@ -24,21 +24,52 @@ pub struct TemplateSummary {
     pub loss_m: f64,
 }
 
+/// 模板文件大小上限：GPX/JSON 都是整文件读入，无上限时几个 GB 的文件会直接吃满内存。
+const MAX_TEMPLATE_BYTES: u64 = 32 * 1024 * 1024;
+
 pub fn load(path: impl AsRef<Path>) -> Result<Vec<ElevationSample>, String> {
     let path = path.as_ref();
+    let meta = fs::metadata(path).map_err(|e| format!("读取模板失败: {e}"))?;
+    if !meta.is_file() {
+        return Err("模板路径不是普通文件".into());
+    }
+    if meta.len() > MAX_TEMPLATE_BYTES {
+        return Err(format!(
+            "模板过大（{:.1} MB），上限 {} MB",
+            meta.len() as f64 / 1024.0 / 1024.0,
+            MAX_TEMPLATE_BYTES / 1024 / 1024
+        ));
+    }
     let text = fs::read_to_string(path).map_err(|e| format!("读取模板失败: {e}"))?;
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
-    let samples = if ext == "gpx" || text.contains("<trkpt") {
-        parse_gpx(&text)?
-    } else if ext == "json" || text.trim_start().starts_with('{') || text.trim_start().starts_with('[') {
-        parse_json(&text)?
-    } else {
-        return Err("仅支持 GPX 或 JSON 本地记录".into());
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    // 扩展名优先：JSON 里出现 "<trkpt" 这种字符串时，按内容嗅探会误判成 GPX。
+    let samples = match ext.as_str() {
+        "gpx" => parse_gpx(&text)?,
+        "json" => parse_json(&text)?,
+        _ if text.contains("<trkpt") => parse_gpx(&text)?,
+        _ if text.trim_start().starts_with('{') || text.trim_start().starts_with('[') => {
+            parse_json(&text)?
+        }
+        _ => return Err("仅支持 GPX 或 JSON 本地记录".into()),
     };
     if samples.is_empty() {
         return Err("模板中没有找到海拔采样点".into());
     }
     Ok(samples)
+}
+
+/// 纬度合法性：非有限值或越界一律视为「没有坐标」，避免脏数据进入摘要。
+fn valid_lat(v: f64) -> Option<f64> {
+    (v.is_finite() && (-90.0..=90.0).contains(&v)).then_some(v)
+}
+
+/// 经度合法性。
+fn valid_lon(v: f64) -> Option<f64> {
+    (v.is_finite() && (-180.0..=180.0).contains(&v)).then_some(v)
 }
 
 pub fn summarize(path: impl AsRef<Path>, samples: &[ElevationSample]) -> TemplateSummary {
@@ -77,7 +108,13 @@ fn parse_gpx(text: &str) -> Result<Vec<ElevationSample>, String> {
         let Some(close) = body.find("</trkpt>") else { break };
         let point = &body[..close];
         if let Some(ele) = tag_number(point, "ele") {
-            out.push(ElevationSample { latitude: lat, longitude: lon, elevation_m: ele });
+            if ele.is_finite() {
+                out.push(ElevationSample {
+                    latitude: lat.and_then(valid_lat),
+                    longitude: lon.and_then(valid_lon),
+                    elevation_m: ele,
+                });
+            }
         }
         rest = &body[close + "</trkpt>".len()..];
     }
@@ -117,9 +154,15 @@ fn collect_json(value: &Value, out: &mut Vec<ElevationSample>) {
         Value::Object(map) => {
             let elevation = ["ele", "elevation", "altitude", "bdA"]
                 .iter().find_map(|k| number(map.get(*k)));
-            if let Some(elevation_m) = elevation {
-                let latitude = ["lat", "latitude", "gLat"].iter().find_map(|k| number(map.get(*k)));
-                let longitude = ["lon", "lng", "longitude", "gLng"].iter().find_map(|k| number(map.get(*k)));
+            if let Some(elevation_m) = elevation.filter(|v| v.is_finite()) {
+                let latitude = ["lat", "latitude", "gLat"]
+                    .iter()
+                    .find_map(|k| number(map.get(*k)))
+                    .and_then(valid_lat);
+                let longitude = ["lon", "lng", "longitude", "gLng"]
+                    .iter()
+                    .find_map(|k| number(map.get(*k)))
+                    .and_then(valid_lon);
                 out.push(ElevationSample { latitude, longitude, elevation_m });
             }
             for child in map.values() { collect_json(child, out); }
@@ -147,6 +190,28 @@ mod tests {
         assert_eq!(points.len(), 2);
         assert_eq!(points[0].elevation_m, 3.3);
         assert_eq!(points[1].latitude, Some(39.91));
+    }
+
+    /// 越界/非有限的坐标与海拔不能污染摘要。
+    #[test]
+    fn rejects_out_of_range_and_non_finite_values() {
+        let points = parse_json(
+            r#"[{"lat":999,"lon":181,"ele":3.3},{"gLat":39.9,"gLng":116.4,"ele":"NaN"},{"gLat":39.9,"gLng":116.4,"ele":5.0}]"#,
+        )
+        .unwrap();
+        assert_eq!(points.len(), 2, "非有限海拔应被丢弃");
+        assert_eq!(points[0].latitude, None);
+        assert_eq!(points[0].longitude, None);
+        assert!(points[1].latitude.is_some());
+    }
+
+    /// 扩展名是 json 时，即使内容里出现 "<trkpt" 也按 JSON 解析。
+    #[test]
+    fn json_extension_wins_over_content_sniffing() {
+        let text = r#"[{"note":"<trkpt lat=\"1\">","ele":7.5}]"#;
+        let points = parse_json(text).unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].elevation_m, 7.5);
     }
 
     #[test]

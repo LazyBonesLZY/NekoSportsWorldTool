@@ -323,9 +323,10 @@ pub fn drag_f64(
     #[cfg(not(target_os = "android"))]
     {
         let _ = id_source;
-        let _ = range;
+        // 桌面端也保留范围校验：锚点纬度/经度越界会让 anchor_coordinate() 直接失败。
         ui.add(
             egui::DragValue::new(value)
+                .range(range)
                 .speed(speed)
                 .fixed_decimals(decimals),
         )

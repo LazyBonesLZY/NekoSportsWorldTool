@@ -21,13 +21,29 @@ pub const LOGOUT_PATH: &str = "/api/v6/user/logout";
 pub const CAPTCHA_ID_BIZ0: &str = "8c065103d81f5fd3efec8ad3e3a84c30";
 
 /// checkGeeUse 免验证码探测：data=true 时本次登录可跳过 GT4 与 geevalidate。
+///
+/// IPA `-[LogAndRegController ac_loginButtonOnClick:]` @0x1002fa454 用
+/// `[[NSUUID UUID] UUIDString]`（**大写带连字符**）作为 uuid，且免验证码路径的
+/// login 复用**同一个** uuid；`+[SWCHttpTool checkGeeUseWithPhone:uuid:type:completion:]`
+/// @0x10027a408 里 `unid` 取 `getUNID ?: "0"`、`type` 是 `CFSTR("2")` ——
+/// **两者都是 NSString**，不是数字。
 /// 未登录态调用（uid=-1/token=""）；请求异常一律按 false 走原流程。
-fn gee_check(client: &mut ApiClient, username: &str, log: &mut dyn FnMut(&str)) -> bool {
+fn gee_check(
+    client: &mut ApiClient,
+    username: &str,
+    uuid_value: &str,
+    log: &mut dyn FnMut(&str),
+) -> bool {
+    let unid = client
+        .login
+        .as_ref()
+        .map(|s| s.unid.clone())
+        .unwrap_or_else(|| "0".to_string());
     let body = json!({
         "username": username,
-        "uuid": uuid::Uuid::new_v4().to_string(),
-        "unid": 0,
-        "type": 2,
+        "uuid": uuid_value,
+        "unid": unid,
+        "type": "2",
     })
     .to_string();
     match client.call("POST", GEECHECK_PATH, &body, &[]) {
@@ -54,8 +70,9 @@ pub fn login(
     password: &str,
     log: &mut dyn FnMut(&str),
 ) -> Result<Session, String> {
-    let uuid_value = uuid::Uuid::new_v4().to_string();
-    if gee_check(client, username, log) {
+    // UUIDString 是**大写**（真机全链 nonce/login/gee uuid 都是大写）。
+    let uuid_value = uuid::Uuid::new_v4().to_string().to_uppercase();
+    if gee_check(client, username, &uuid_value, log) {
         log("[login] 免验证码路径：直接登录");
     } else {
         // GT4 → geevalidate；10003（验证失败）时重破滑块再验，最多 3 轮
@@ -64,9 +81,13 @@ pub fn login(
         for attempt in 1..=3 {
             log("[login] 开始 GT4 滑块验证…");
             let creds = solve_gt4(captcha_id, client, log)?;
+            // lot_number 是极验的一次性凭据，不进日志原文（只留前 6 位便于对时序）。
             log(&format!(
-                "[login] GT4 通过 lot_number={}",
-                creds.get("lotNumber").and_then(|v| v.as_str()).unwrap_or("")
+                "[login] GT4 通过 lot_number={}…",
+                crate::api::client::safe_truncate(
+                    creds.get("lotNumber").and_then(|v| v.as_str()).unwrap_or(""),
+                    6
+                )
             ));
 
             let body = json!({
@@ -95,9 +116,12 @@ pub fn login(
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 }
                 other => {
-                    log(&format!("[geevalidate] err={other:?}（继续尝试登录）"));
-                    validated = true; // 非 10003 的失败不阻塞登录（服务端可能仍放行）
-                    break;
+                    // 真机 `sub_100311F7C` 走 `callFailure` 直接终止，不会继续 login。
+                    // 之前把 10121（设备风险）/10001（参数错）等真实错误吞成"继续登录"，
+                    // 最终只会报"登录响应缺 uid/token"这种次级错误，排查困难。
+                    return Err(format!(
+                        "geevalidate 失败（error={other:?}），已终止登录"
+                    ));
                 }
             }
         }
@@ -115,38 +139,24 @@ pub fn login(
     } else {
         identity.device_id.clone()
     };
-    let login_body = if identity.platform == "android" {
-        // Android 形态（与 build_android_header 同源）：osType="0"，mac 取持久化 MAC。
-        json!({
-            "device_model": identity.device_name,
-            "os_version": identity.os_version,
-            "mac_address": identity.mac_address,
-            "imei": "",
-            "loginType": 0,
-            "username": username,
-            "password": password,
-            "uuid": uuid_value,
-            "osType": "0",
-        })
-        .to_string()
-    } else {
-        // iOS 7.4.0 getEquipmentInformation + loginType/uuid：
-        // device_id/imei 取 WHSimulateIDFA；mac_address 为字面量 "nil"；channel 固定 APPStore。
-        let idfa = identity.idfa.clone();
-        json!({
-            "app_version": crate::crypto::header::IOS_APP_VERSION,
-            "device_model": identity.device_name,
-            "os_version": identity.os_version,
-            "os_type": 1,
-            "device_id": idfa,
-            "mac_address": "nil",
-            "imei": idfa,
-            "channel": "APPStore",
-            "loginType": 0,
-            "uuid": uuid_value,
-        })
-        .to_string()
-    };
+    // iOS 7.4.0 getEquipmentInformation + loginType/uuid：
+    // device_id/imei 取 WHSimulateIDFA；mac_address 为字面量 "nil"；channel 固定 APPStore。
+    // 必须走 effective_idfa：空 idfa 时要与请求头里发送的值完全一致，
+    // 否则同一次登录里 header 用派生值、登录体用空串，是显式的指纹矛盾。
+    let idfa = identity.effective_idfa();
+    let login_body = json!({
+        "app_version": crate::crypto::header::IOS_APP_VERSION,
+        "device_model": identity.device_name,
+        "os_version": identity.os_version,
+        "os_type": 1,
+        "device_id": idfa,
+        "mac_address": "nil",
+        "imei": idfa,
+        "channel": "APPStore",
+        "loginType": 0,
+        "uuid": uuid_value,
+    })
+    .to_string();
     let credential = B64.encode(format!("{username}:{password}"));
     let extra = vec![("Authorization".to_string(), format!("Basic {credential}"))];
     let url = format!("{HOST}{LOGIN_PATH}");
@@ -178,7 +188,8 @@ pub fn login(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        weight: get_field(&biz, "weight").and_then(|v| v.as_f64()).unwrap_or(68.0),
+        // 服务端没下发就存 0（协议层要靠它决定 calorie 是否为 0），展示层再回退 68。
+        weight: get_field(&biz, "weight").and_then(|v| v.as_f64()).unwrap_or(0.0),
         username: username.to_string(),
         device_id,
         profile: super::client::parse_data_field(&biz),
@@ -186,14 +197,15 @@ pub fn login(
     if let Err(e) = super::model::save_session(&sess) {
         eprintln!("[login] 会话保存失败: {e}");
     }
+    // 姓名是真实 PII，DeviceId 是可跨请求聚类的设备指纹：两者都不进日志原文。
     eprintln!(
-        "[session] uid={} token={} unid={} name={} weight={} device={}",
+        "[session] uid={} token={} unid={} name={} weight={} device={}…",
         sess.uid,
         crate::textlog::mask(&sess.token),
         sess.unid,
-        sess.name,
+        crate::textlog::mask(&sess.name),
         sess.weight,
-        sess.device_id
+        crate::api::client::safe_truncate(&sess.device_id, 8)
     );
     eprintln!(
         "[session] profile 字段数={}",
@@ -202,14 +214,16 @@ pub fn login(
     Ok(sess)
 }
 
-/// 登出并清理 。
+/// 登出并清理本地会话。
 pub fn logout(client: &mut ApiClient, log: &mut dyn FnMut(&str)) {
     if let Some(sess) = client.login.clone() {
         let _ = client.call("POST", LOGOUT_PATH, "{}", &[]);
         log(&format!("[logout] 已请求登出 uid={}", sess.uid));
     }
+    // 内存里的登录态也要清：否则复用同一个 ApiClient 时后续请求仍会带旧 uid/token。
+    client.login = None;
     super::model::clear_session();
-    log("[logout] 本地  已删除");
+    log("[logout] 本地会话已删除");
 }
 
 fn truncate(s: &str, n: usize) -> String {

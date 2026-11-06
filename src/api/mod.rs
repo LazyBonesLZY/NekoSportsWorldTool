@@ -6,6 +6,7 @@ pub mod client;
 pub mod fence;
 pub mod flow;
 pub mod gt4;
+pub mod indoor;
 pub mod gt4image;
 pub mod login;
 pub mod model;

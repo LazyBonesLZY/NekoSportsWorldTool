@@ -8,6 +8,9 @@ use route_planner::{Coord, RoadGraph};
 use super::map::{collect_bounds, MapState};
 use super::{theme, App};
 
+/// OSM 文件大小上限（超过直接拒绝，避免整文件读入把内存吃满）。
+const MAX_OSM_BYTES: u64 = 256 * 1024 * 1024;
+
 #[derive(Default)]
 pub struct OsmPage {
     pub path: String,
@@ -166,11 +169,26 @@ impl App {
         let _ = crate::api::model::save_config(&self.config);
         let tx = self.net_tx.clone();
         std::thread::spawn(move || {
-            let res = (|| -> Result<Arc<RoadGraph>, String> {
-                let bytes = std::fs::read(&path).map_err(|e| format!("读取失败: {e}"))?;
-                let net = route_planner::load_osm(&bytes)?;
-                Ok(Arc::new(net))
-            })();
+            // panic 兜底：否则 osm_page.busy 永远为真，「加载路网」按钮永久禁用。
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (|| -> Result<Arc<RoadGraph>, String> {
+                    let meta = std::fs::metadata(&path).map_err(|e| format!("读取失败: {e}"))?;
+                    if meta.len() > MAX_OSM_BYTES {
+                        return Err(format!(
+                            "文件过大（{:.1} MB），超过 {} MB 上限",
+                            meta.len() as f64 / 1024.0 / 1024.0,
+                            MAX_OSM_BYTES / 1024 / 1024
+                        ));
+                    }
+                    let bytes = std::fs::read(&path).map_err(|e| format!("读取失败: {e}"))?;
+                    let net = route_planner::load_osm(&bytes)?;
+                    Ok(Arc::new(net))
+                })()
+            }));
+            let res = match outcome {
+                Ok(r) => r,
+                Err(_) => Err("路网解析线程异常退出（文件可能损坏或超出支持范围）".to_string()),
+            };
             let _ = tx.send(res);
         });
     }

@@ -16,60 +16,11 @@ import android.widget.FrameLayout;
 public final class MainActivity extends NativeActivity {
     static { System.loadLibrary("nekosportsworldtool"); }
     private AlertDialog editorDialog;
-    private AlertDialog deviceInfoDialog;
     private boolean taskActive;
     private boolean resumed;
 
     private native void nativeSubmitEdit(long id, String value);
     private native void nativeSetInsets(int left, int top, int right, int bottom);
-    private native void nativeDeviceInfo(boolean initial, String info, String error);
-
-    public void requestDeviceInfo(boolean initial) {
-        runOnUiThread(() -> {
-            android.content.SharedPreferences preferences = getSharedPreferences("device_info", MODE_PRIVATE);
-            if (isFinishing() || isDestroyed() || deviceInfoDialog != null) return;
-            if (initial && preferences.getBoolean("asked", false)) return;
-            String purpose = initial
-                ? "允许后会保存到设备身份，用于后续登录和业务请求。"
-                : "允许后只填写设备页，点击“保存”后用于后续登录和业务请求。";
-            AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle("读取本机信息")
-                .setMessage("是否允许读取本机品牌、型号和 Android 系统版本？\n\n" + purpose
-                    + "品牌仅用于设备页展示。"
-                    + "\n\n设备 UUID 继续沿用本应用首次生成并保存的值，不会更换。拒绝后仍可手动填写，也可在设备页再次读取。")
-                .setPositiveButton("允许读取", (ignored, which) -> {
-                    // First-run completion is acknowledged only after Rust saves it.
-                    // If the Activity/process exits earlier, the next launch asks again.
-                    if (!initial) preferences.edit().putBoolean("asked", true).apply();
-                    try {
-                        // These fields are read only after the user accepts this dialog.
-                        org.json.JSONObject info = new org.json.JSONObject();
-                        info.put("manufacturer", android.os.Build.MANUFACTURER);
-                        info.put("model", android.os.Build.MODEL);
-                        info.put("os_version", android.os.Build.VERSION.RELEASE);
-                        nativeDeviceInfo(initial, info.toString(), "");
-                    } catch (Exception error) {
-                        nativeDeviceInfo(initial, "", "读取本机信息失败，请在设备页重试或手动填写");
-                    }
-                })
-                .setNegativeButton("暂不读取", (ignored, which) -> {
-                    preferences.edit().putBoolean("asked", true).apply();
-                    nativeDeviceInfo(initial, "", "");
-                })
-                .create();
-            dialog.setOnCancelListener(ignored -> {
-                preferences.edit().putBoolean("asked", true).apply();
-                nativeDeviceInfo(initial, "", "");
-            });
-            dialog.setOnDismissListener(ignored -> deviceInfoDialog = null);
-            deviceInfoDialog = dialog;
-            dialog.show();
-        });
-    }
-
-    public void completeDeviceInfo() {
-        getSharedPreferences("device_info", MODE_PRIVATE).edit().putBoolean("asked", true).apply();
-    }
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -226,7 +177,6 @@ public final class MainActivity extends NativeActivity {
 
     @Override protected void onDestroy() {
         if (editorDialog != null) editorDialog.dismiss();
-        if (deviceInfoDialog != null) deviceInfoDialog.dismiss();
         taskActive = false;
         updateScreenPolicy();
         super.onDestroy();

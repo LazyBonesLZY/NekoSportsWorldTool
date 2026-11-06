@@ -1,4 +1,4 @@
-//! 协议加密层：信封加密 / 请求头 / 响应解密 / Android 提交签名。
+//! 协议加密层：信封加密 / iOS 请求头 / 响应解密 / iOS 提交签名。
 
 pub mod decrypt;
 pub mod envelope;

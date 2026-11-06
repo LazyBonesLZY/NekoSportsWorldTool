@@ -1,8 +1,8 @@
 //! 跑步页：恒 sportType=1；距离/配速范围 + 开始时间（随机或指定，最多前 3 天）。
 //!
 //! 开始时间：「日期」下拉（今天 / 1-3 天前）两种模式共用；随机模式在该日 7:00-20:00
-//! 内抽样，并保证「开始 + 用时」不越过当前时刻；指定模式完全按用户填写的时/分
-//! （尚未到达时按当前时刻），「换一版」只重掷运动量，不动时刻。
+//! 内抽样。**两种模式都硬保证「开始 + 用时 + 抖动」不越过当前时刻**（未来记录会被
+//! 服务端判异常），指定时刻被前移时会在运行日志里写明。「换一版」只重掷运动量。
 
 use super::map::MapState;
 use super::{mobile, theme, App};
@@ -10,46 +10,49 @@ use crate::track::generate_road::RouteMode;
 use chrono::{Datelike, Duration, Local, TimeZone, Timelike};
 use eframe::egui;
 
-/// 随机时刻窗口（含端点）：7:00-20:00。
-const RAND_HOUR_LO: u32 = 7;
-const RAND_HOUR_HI: u32 = 20;
-/// flow.rs 提交时会给开始时间加 0-4s 抖动，随机模式抽样时预留，避免「开始 + 用时」越过当前时刻。
-const JITTER_MARGIN_MS: i64 = 5_000;
+/// 开始时刻的三种语义全部来自 `crate::cli`（CLI 的 `run` 用同一份实现），
+/// 避免界面与命令行各写一份公式后再次分叉。
+use crate::cli::{RAND_HOUR_HI, RAND_HOUR_LO};
+/// 仅测试用于断言「整段跑步不越过当前时刻」。
+#[cfg(test)]
+use crate::cli::JITTER_MARGIN_MS;
 
-/// 指定日期（days_ago 天前）的 7:00-20:00 内均匀抽样一个时刻，且不晚于 latest_ms。
-///
-/// latest_ms = 当前时刻 - 用时 - 抖动余量。若该日窗口整体晚于 latest_ms（例如凌晨选「今天」），
-/// 退化为 latest_ms，宁可贴近当前时间，也不产生「未来开跑」。
+/// 指定日期（days_ago 天前）7:00-20:00 内抽样，且不晚于 `latest_ms`。
 fn random_time_ago(days_ago: i64, latest_ms: i64) -> i64 {
-    let base = Local::now() - Duration::days(days_ago.clamp(0, 3));
-    let lo = Local
-        .with_ymd_and_hms(base.year(), base.month(), base.day(), RAND_HOUR_LO, 0, 0)
-        .single();
-    let hi = Local
-        .with_ymd_and_hms(base.year(), base.month(), base.day(), RAND_HOUR_HI, 0, 0)
-        .single();
-    let (lo_ms, hi_ms) = match (lo, hi) {
-        (Some(l), Some(h)) => (l.timestamp_millis(), h.timestamp_millis()),
-        _ => return latest_ms,
-    };
-    let hi_ms = hi_ms.min(latest_ms);
-    let lo_ms = lo_ms.min(hi_ms);
-    let span = (hi_ms - lo_ms).max(0) as f64;
-    lo_ms + (rand::random::<f64>() * span) as i64
+    crate::cli::random_start_ms(crate::crypto::envelope::now_ms(), days_ago, latest_ms)
 }
 
-/// 指定时刻：days_ago(0=今天) + 时/分；超出 3 天或在未来时做钳制。
-fn specified_time(days_ago: i64, hour: i64, minute: i64) -> i64 {
-    let now = Local::now();
-    let base = now - Duration::days(days_ago.clamp(0, 3));
-    let h = hour.clamp(0, 23);
-    let m = minute.clamp(0, 59);
-    let t = Local
-        .with_ymd_and_hms(base.year(), base.month(), base.day(), h as u32, m as u32, 0)
-        .single()
-        .map(|x| x.timestamp_millis())
-        .unwrap_or_else(crate::crypto::envelope::now_ms);
-    t.min(now.timestamp_millis())
+/// 指定时刻：days_ago(0=今天) + 时/分；保证整段记录不落在未来。
+fn specified_time(days_ago: i64, hour: i64, minute: i64, dur: i64) -> i64 {
+    crate::cli::specified_start_ms(
+        crate::crypto::envelope::now_ms(),
+        days_ago,
+        hour,
+        minute,
+        dur,
+    )
+}
+
+/// 方案有效期：超过即认为开始时刻已陈旧，下次进页面/提交前重抽。
+const PLAN_TTL_MS: i64 = 10 * 60 * 1000;
+
+/// 与 `api::flow` 同源的时长修正：平均速度超出生成器有效窗口时，时长会被改写。
+///
+/// UI 必须先按修正后的时长钳制开始时刻，否则会出现「界面写 8 分钟、实际提交 16 分钟」，
+/// 严重时 stopTime 会落到未来。
+fn corrected_dur(dist_m: f64, dur_s: i64) -> i64 {
+    if dur_s <= 0 || dist_m <= 0.0 {
+        return dur_s;
+    }
+    let avg = dist_m / dur_s as f64;
+    let floor = crate::track::generator::SPEED_FLOOR + 0.1;
+    let ceil = crate::track::generator::SPEED_CEIL - 0.1;
+    let fixed = avg.clamp(floor, ceil);
+    if (fixed - avg).abs() > 1e-6 {
+        (dist_m / fixed).round() as i64
+    } else {
+        dur_s
+    }
 }
 
 /// 日期下拉的显示文本。
@@ -79,8 +82,6 @@ pub struct RunPage {
     pub plan: Option<RunPlan>,
     /// 路线算法模式
     pub route_mode: RouteMode,
-    /// 提交身份形态：true=ios（与全链同身份，消除机型跳变指纹）
-    pub submit_ios: bool,
     /// 地图视图状态
     pub map: MapState,
     /// 路网预览（真实道路路由）
@@ -89,6 +90,8 @@ pub struct RunPage {
     pub preview_stale: bool,
     /// 地图视野是否已适配
     pub map_fitted: bool,
+    /// 参数改动后待落盘（拖动中不写盘，松手后一次性写入 config.json）
+    pub pending_save: bool,
 }
 
 /// 一次提交的确定方案（进入页面/参数变更时抽样生成）。
@@ -111,6 +114,8 @@ pub struct RunPlan {
     pub start_ms: i64,
     /// 本次方案的随机种子（预览与提交共用，保证所见即所得）
     pub seed: u64,
+    /// 方案生成时刻（毫秒）：超过 PLAN_TTL_MS 即重抽开始时刻。
+    pub created_at: i64,
 }
 
 impl RunPage {
@@ -134,7 +139,7 @@ impl RunPage {
 
     /// 开跑时刻上限：当前时刻 - 用时 - 抖动余量（flow.rs 提交时还会再加 0-4s）。
     fn latest_start_ms(dur: i64) -> i64 {
-        crate::crypto::envelope::now_ms() - dur * 1000 - JITTER_MARGIN_MS
+        crate::cli::latest_start_ms(crate::crypto::envelope::now_ms(), dur)
     }
 
     /// 按当前参数抽样运动量（距离 / 配速 / 用时）。
@@ -155,10 +160,17 @@ impl RunPage {
 
     /// 按当前模式与日期取一个开始时刻（随机模式抽样，指定模式采纳输入框）。
     fn pick_time(&self) -> i64 {
+        self.pick_time_for(self.dur_hint())
+    }
+
+    /// 指定用时下的开始时刻。
+    ///
+    /// 重抽运动量时必须传**新**用时：用旧用时钳制会让「用时变长」的方案结束在未来。
+    fn pick_time_for(&self, dur: i64) -> i64 {
         if self.start_mode == 0 {
-            random_time_ago(self.days_ago, Self::latest_start_ms(self.dur_hint()))
+            random_time_ago(self.days_ago, Self::latest_start_ms(dur))
         } else {
-            specified_time(self.days_ago, self.hour, self.minute)
+            specified_time(self.days_ago, self.hour, self.minute, dur)
         }
     }
 
@@ -180,7 +192,7 @@ impl RunPage {
         let start_ms = match (&self.plan, self.start_mode) {
             // 随机模式沿用已抽样的时刻（仅按新用时收紧上限），避免拖动距离时时刻乱跳
             (Some(p), 0) => p.start_ms.min(Self::latest_start_ms(dur)),
-            _ => self.pick_time(),
+            _ => self.pick_time_for(dur),
         };
         self.write_plan(dist, pace, dur, start_ms);
     }
@@ -213,6 +225,7 @@ impl RunPage {
             dur,
             start_ms,
             seed: rand::random::<u64>(),
+            created_at: crate::crypto::envelope::now_ms(),
         });
         self.preview_stale = true;
     }
@@ -225,7 +238,7 @@ impl RunPage {
         let start_ms = if self.start_mode == 0 {
             random_time_ago(self.days_ago, Self::latest_start_ms(dur))
         } else {
-            specified_time(self.days_ago, self.hour, self.minute)
+            specified_time(self.days_ago, self.hour, self.minute, dur)
         };
         self.write_plan(dist, pace, dur, start_ms);
     }
@@ -237,12 +250,31 @@ impl RunPage {
     pub fn ensure_plan(&mut self) {
         let shape_ok = self.plan.as_ref().map(|p| self.shape_matches(p)) == Some(true);
         let time_ok = self.plan.as_ref().map(|p| self.time_matches(p)) == Some(true);
+        // 陈旧方案（长开页面）：随机时刻会脱离当前时间，必须重抽。
+        let stale = self
+            .plan
+            .as_ref()
+            .map(|p| crate::crypto::envelope::now_ms() - p.created_at > PLAN_TTL_MS)
+            .unwrap_or(false);
         if !shape_ok {
             self.regen_shape();
         }
-        if !time_ok {
+        if !time_ok || stale {
             self.resync_time();
         }
+    }
+
+    /// 提交前强制重算开始时刻：随机模式重新抽样，指定模式重新钳制。
+    ///
+    /// 返回 (旧值, 新值)，便于调用方在日志里说明时刻被动过。
+    pub fn refresh_time_for_submit(&mut self) -> Option<(i64, i64)> {
+        let before = self.plan.as_ref()?.start_ms;
+        self.resync_time();
+        if let Some(p) = self.plan.as_mut() {
+            p.created_at = crate::crypto::envelope::now_ms();
+        }
+        let after = self.plan.as_ref().map(|p| p.start_ms)?;
+        Some((before, after))
     }
 
     /// 随机模式的抽样结果是否落在所选日期的 7:00-20:00 窗口内。
@@ -270,6 +302,7 @@ impl App {
 
     fn draw_run_content(&mut self, ui: &mut egui::Ui) {
         let prev_route = self.run_page.route_mode;
+        let before = self.run_settings_snapshot();
         {
             let page = &mut self.run_page;
             let compact = mobile::compact_ui(ui);
@@ -366,31 +399,13 @@ impl App {
                     mobile::drag_i64(ui, "run_minute", &mut page.minute, 0..=59, 1.0, "", "");
                 }
             });
-            if page.start_mode == 1 && page.days_ago == 0 {
-                // 今天 + 指定时刻：提示是否落在未来
-                let now = Local::now();
-                let spec = Local
-                    .with_ymd_and_hms(
-                        now.year(),
-                        now.month(),
-                        now.day(),
-                        page.hour as u32,
-                        page.minute as u32,
-                        0,
-                    )
-                    .single();
-                if let Some(t) = spec {
-                    if t.timestamp_millis() > crate::crypto::envelope::now_ms() {
-                        ui.colored_label(
-                            theme::warn(),
-                            "指定时刻在今天且尚未到达，将按当前时间提交",
-                        );
-                    }
-                }
-            }
             mobile::row(ui, |ui| {
                 ui.label("人脸校验标记：");
                 ui.checkbox(&mut page.face_check, "faceCheck=1");
+                ui.colored_label(
+                    theme::warn(),
+                    "（仅在策略 faceVerify=true 时生效；场地未开启核验时实机发 0）",
+                );
             });
             ui.horizontal(|ui| {
                 ui.label("路线算法：");
@@ -400,14 +415,10 @@ impl App {
                     ui.colored_label(theme::warn(), "（需先在「路网」页导入 OSM）");
                 }
             });
-            ui.horizontal(|ui| {
-                ui.label("提交身份：");
-                ui.selectable_value(&mut page.submit_ios, true, "iOS（默认，实机语义）");
-                ui.selectable_value(&mut page.submit_ios, false, "Android（兼容兜底）");
-                if !page.submit_ios {
-                    ui.colored_label(theme::warn(), "兼容形态：若 iOS 形态被拒再切回");
-                }
-            });
+        }
+
+        if self.run_settings_snapshot() != before {
+            self.run_page.pending_save = true;
         }
 
         // 切换到真实道路路由时按需拉取电子围栏与实时点位（经典模式不触发这些端点）。
@@ -454,9 +465,28 @@ impl App {
         self.draw_run_map(ui);
 
         ui.add_space(8.0);
-        let enabled = !self.run_busy && self.session.is_some();
-        let btn = if self.run_busy {
+        // 与 flow 同源的时长修正提示：界面显示的时长和真正提交的可能不同
+        if let Some(p) = &self.run_page.plan {
+            let dist_m = p.dist * 1000.0;
+            let fixed = corrected_dur(dist_m, p.dur);
+            if fixed != p.dur {
+                ui.colored_label(
+                    theme::warn(),
+                    format!(
+                        "平均配速超出有效窗口，提交时用时会修正为 {}（界面值 {}）",
+                        fmt_dur(fixed),
+                        fmt_dur(p.dur)
+                    ),
+                );
+            }
+        }
+        let enabled = !self.submission_busy()
+            && self.session.is_some()
+            && self.identity_error.is_none();
+        let btn = if self.busy(super::JobKind::Run) {
             theme::primary_btn("提交中…")
+        } else if self.busy(super::JobKind::AiSubmit) {
+            theme::primary_btn("AI 提交中…")
         } else {
             theme::primary_btn("开始跑步")
         };
@@ -466,8 +496,71 @@ impl App {
             }
             if self.session.is_none() {
                 ui.label("（请先登录）");
+            } else if self.identity_error.is_some() {
+                ui.label("（设备身份不可用）");
+            } else if self.busy(super::JobKind::AiSubmit) {
+                ui.label("（AI 提交进行中，暂不可同时跑步）");
             }
         });
+
+        // 参数改动在指针松开后一次性落盘（拖动过程中不每帧写文件）。
+        if self.run_page.pending_save && !ui.ctx().input(|i| i.pointer.any_down()) {
+            self.run_page.pending_save = false;
+            self.persist_run_settings();
+        }
+    }
+
+    /// 参与持久化的界面参数快照（用于判断是否有未保存的改动）。
+    fn run_settings_snapshot(&self) -> (f32, f32, f32, f32, bool, String, RouteMode) {
+        let p = &self.run_page;
+        (
+            p.dist_min,
+            p.dist_max,
+            p.pace_min,
+            p.pace_max,
+            p.face_check,
+            p.manual_altitude.clone(),
+            p.route_mode,
+        )
+    }
+
+    /// 把跑步页参数写进 config.json（海拔解析失败时保留旧值，不在打字途中报错）。
+    fn persist_run_settings(&mut self) {
+        let page = &self.run_page;
+        self.config.dist_min = page.dist_min;
+        self.config.dist_max = page.dist_max;
+        self.config.pace_min = page.pace_min;
+        self.config.pace_max = page.pace_max;
+        self.config.face_check = page.face_check;
+        self.config.route_mode = if page.route_mode == RouteMode::Road {
+            "road".into()
+        } else {
+            "legacy".into()
+        };
+        // 开始时间设置也要落盘：否则「指定时刻 + 昨天」每次重启都回到 12:00 今天。
+        self.config.start_mode = page.start_mode as i64;
+        self.config.days_ago = page.days_ago;
+        self.config.hour = page.hour;
+        self.config.minute = page.minute;
+        if let Ok(spec) = crate::track::altitude::parse_spec(&page.manual_altitude) {
+            match spec {
+                None => {
+                    self.config.manual_altitude = None;
+                    self.config.manual_altitude_range = None;
+                }
+                Some(crate::track::altitude::AltitudeSpec::Single(v)) => {
+                    self.config.manual_altitude = Some(v);
+                    self.config.manual_altitude_range = None;
+                }
+                Some(crate::track::altitude::AltitudeSpec::Range(r)) => {
+                    self.config.manual_altitude = None;
+                    self.config.manual_altitude_range = Some(r);
+                }
+            }
+        }
+        if let Err(e) = crate::api::model::save_config(&self.config) {
+            self.status = format!("× 跑步参数保存失败：{e}");
+        }
     }
 
     /// 开始时间相关的提示。须在 `ensure_plan()` 之后调用，才对得上本次提交时刻。
@@ -484,7 +577,7 @@ impl App {
             }
             return;
         }
-        // 今天 + 指定时刻：提示是否落在未来（与原有行为一致）
+        // 今天 + 指定时刻：按「整段记录不落在未来」判定是否会被前移。
         if page.days_ago != 0 {
             return;
         }
@@ -500,8 +593,20 @@ impl App {
             )
             .single()
         {
-            if t.timestamp_millis() > crate::crypto::envelope::now_ms() {
-                ui.colored_label(theme::warn(), "指定时刻在今天且尚未到达，将按当前时间提交");
+            let dur = page
+                .plan
+                .as_ref()
+                .map(|p| corrected_dur(p.dist * 1000.0, p.dur))
+                .unwrap_or_else(|| page.dur_hint());
+            let latest = crate::cli::latest_start_ms(crate::crypto::envelope::now_ms(), dur);
+            if t.timestamp_millis() > latest {
+                ui.colored_label(
+                    theme::warn(),
+                    format!(
+                        "该时刻会让整段记录结束在未来，提交时开始时刻将前移到 {}",
+                        fmt_ts(latest)
+                    ),
+                );
             }
         }
     }
@@ -694,14 +799,22 @@ impl App {
     }
 
     fn start_run(&mut self) {
+        if let Some(err) = &self.identity_error {
+            self.status = format!("设备身份不可用，已阻止提交：{err}");
+            return;
+        }
+        if self.session.is_none() {
+            self.status = "请先登录".into();
+            return;
+        }
+        // 提交类任务互斥：跑步与 AI 提交不能同时进行（只读刷新不受影响）。
+        if self.submission_busy() {
+            self.status = "已有提交任务在进行，请等它结束".into();
+            return;
+        }
         // 参数变更时补齐方案；提交直接使用预计算值
         self.run_page.ensure_plan();
-        let page = &mut self.run_page;
-        let plan = match page.plan.clone() {
-            Some(p) => p,
-            None => return,
-        };
-        let altitude_spec = match crate::track::altitude::parse_spec(&page.manual_altitude) {
+        let altitude_spec = match crate::track::altitude::parse_spec(&self.run_page.manual_altitude) {
             Ok(spec) => spec,
             Err(e) => {
                 self.status = e;
@@ -713,10 +826,61 @@ impl App {
             Some(crate::track::altitude::AltitudeSpec::Single(value)) => (Some(value), None),
             Some(crate::track::altitude::AltitudeSpec::Range(range)) => (None, Some(range)),
         };
-        let (dist, dur) = (plan.dist * 1000.0, plan.dur); // 米
-        let start_ms = plan.start_ms;
-        let face_check = if page.face_check { 1 } else { 0 };
-        let route_mode = page.route_mode;
+        // 提交前重算开始时刻：长开页面不能复用陈旧方案（随机模式重抽、指定模式重钳）。
+        let time_change = self.run_page.refresh_time_for_submit();
+        let Some(plan) = self.run_page.plan.clone() else {
+            self.status = "参数未就绪，请重试".into();
+            return;
+        };
+        let dist = plan.dist * 1000.0; // 米
+        if dist <= 0.0 || plan.dur <= 0 {
+            self.status = format!(
+                "距离/时长无效（dist={dist:.0}m dur={}s），请检查距离与配速范围",
+                plan.dur
+            );
+            return;
+        }
+        // 与 flow 同源的时长修正：超窗时 flow 会改写 dur，这里先算出来钳时刻。
+        let dur = corrected_dur(dist, plan.dur);
+        if dur != plan.dur {
+            self.log.push(&format!(
+                "⚠ 平均配速超出有效窗口，提交用时由 {} 修正为 {}",
+                fmt_dur_secs(plan.dur),
+                fmt_dur_secs(dur)
+            ));
+        }
+        // 硬钳制：记录结束时刻不得晚于当前时刻（flow 还会再加 0-4s 抖动）。
+        let latest = crate::cli::latest_start_ms(crate::crypto::envelope::now_ms(), dur);
+        let start_ms = plan.start_ms.min(latest);
+        if start_ms != plan.start_ms {
+            self.log.push(&format!(
+                "⚠ {} 会导致记录结束于未来，已前移到 {}",
+                if self.run_page.start_mode == 1 {
+                    "指定时刻"
+                } else {
+                    "抽样时刻"
+                },
+                fmt_ts(start_ms)
+            ));
+        } else if let Some((before, after)) = time_change {
+            if before != after {
+                self.log.push(&format!(
+                    "已按当前时间重抽开始时刻：{} → {}",
+                    fmt_ts(before),
+                    fmt_ts(after)
+                ));
+            }
+        }
+        // 让界面上的「本次方案」与实际提交保持一致。
+        if let Some(p) = self.run_page.plan.as_mut() {
+            p.start_ms = start_ms;
+            p.dur = dur;
+            p.created_at = crate::crypto::envelope::now_ms();
+        }
+
+        let face_check = if self.run_page.face_check { 1 } else { 0 };
+        let route_mode = self.run_page.route_mode;
+        let page = &self.run_page;
         self.config.dist_min = page.dist_min;
         self.config.dist_max = page.dist_max;
         self.config.pace_min = page.pace_min;
@@ -729,24 +893,19 @@ impl App {
         } else {
             "legacy".into()
         };
-        self.config.submit_form = if self.run_page.submit_ios { "ios".into() } else { "android".into() };
         let _ = crate::api::model::save_config(&self.config);
 
         let identity = self.identity.clone();
-        let session = match self.session.clone() {
-            Some(s) => s,
-            None => {
-                self.status = "请先登录".into();
-                return;
-            }
+        let Some(session) = self.session.clone() else {
+            return;
         };
-        self.run_busy = true;
         self.status = "跑步提交中…".into();
         let seed = plan.seed;
-        self.spawn_job(move |tx| {
+        self.spawn_job(super::JobKind::Run, move |tx| {
             let mut log = App::logger(tx.clone());
             let mut client = crate::api::client::ApiClient::new(identity, Some(session));
             let params = crate::api::flow::RunParams {
+                run_mode: 1,
                 dist,
                 dur,
                 start_ms,
@@ -755,6 +914,8 @@ impl App {
                 manual_altitude_range,
                 seed,
                 route_mode,
+                dry_run: false,
+                out_path: None,
             };
             let payload = match crate::api::flow::run_full_flow(&mut client, &params, &mut log) {
                 Ok(out) => {
@@ -779,6 +940,24 @@ impl App {
             };
             tx.send(format!("__RUN_DONE__{payload}")).ok();
         });
+    }
+}
+
+/// 毫秒时间戳 → 本地时间（日志用）。
+fn fmt_ts(ms: i64) -> String {
+    chrono::Local
+        .timestamp_millis_opt(ms)
+        .single()
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_default()
+}
+
+/// 秒数 → `H:MM:SS` / `M:SS`（日志用）。
+fn fmt_dur_secs(s: i64) -> String {
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
     }
 }
 
@@ -818,6 +997,18 @@ mod tests {
         assert!(
             p.start_ms + p.dur * 1000 + JITTER_MARGIN_MS <= now,
             "随机时刻 {} + 用时 {}s 越过当前时刻",
+            p.start_ms,
+            p.dur
+        );
+    }
+
+    /// 硬契约：任何模式下「开始 + 用时 + 抖动」都不得越过当前时刻。
+    fn assert_stop_not_future(p: &RunPlan) {
+        let now = crate::crypto::envelope::now_ms();
+        assert!(
+            p.start_ms + p.dur * 1000 + JITTER_MARGIN_MS <= now,
+            "记录结束时刻 {} 落在未来（start={} dur={}）",
+            p.start_ms + p.dur * 1000,
             p.start_ms,
             p.dur
         );
@@ -903,6 +1094,7 @@ mod tests {
                 p.ensure_plan();
                 let plan = p.plan.as_ref().unwrap();
                 assert_start_not_future(plan);
+                assert_stop_not_future(plan);
                 if mode == 0 {
                     assert_random_not_future(plan);
                 }
@@ -926,18 +1118,19 @@ mod tests {
             .single()
             .unwrap()
             .timestamp_millis();
-        // 凌晨 0:30 尚未到达时会被钳制，跳过断言
-        if want <= crate::crypto::envelope::now_ms() {
+        // 离现在足够远（整段记录早已结束）时必须原样保留
+        let now_ms = crate::crypto::envelope::now_ms();
+        if want <= crate::cli::latest_start_ms(now_ms, plan.dur) {
             assert_eq!(plan.start_ms, want, "已过去的指定时刻不应被改动");
         }
-        assert_start_not_future(&plan);
+        assert_stop_not_future(&plan);
     }
 
-    /// 未来的指定时刻被钳制到当前时刻；已过去的时刻原样保留。
+    /// 未来的指定时刻必须被钳到「整段记录都在过去」。
     ///
-    /// 断言直接对齐契约 `min(填入时刻, 现在)`，与运行时刻无关（23:59 跑也不会误报）。
+    /// 契约：`min(填入时刻, now - dur - 5s)`（只钳到 now 会让 stopTime 落到未来）。
     #[test]
-    fn specified_time_is_clamped_to_now() {
+    fn specified_time_is_clamped_before_now() {
         let now = Local::now();
         let mut p = page(1, 0);
         p.hour = 23;
@@ -954,10 +1147,10 @@ mod tests {
         let now_ms = crate::crypto::envelope::now_ms();
         assert_eq!(
             plan.start_ms,
-            want.min(now_ms),
-            "指定时刻未按 min(填入, 现在) 处理"
+            want.min(crate::cli::latest_start_ms(now_ms, plan.dur)),
+            "指定时刻未按 min(填入, now-dur-5s) 处理"
         );
-        assert_start_not_future(&plan);
+        assert_stop_not_future(&plan);
     }
 
     /// 改距离/配速只重抽运动量，不应打乱用户指定的时刻。
@@ -1077,7 +1270,7 @@ mod tests {
         let plan = p.plan.clone().unwrap();
         assert_eq!((plan.hour, plan.minute), (8, 20), "时刻变化被漏掉");
         assert!(plan.dist >= 4.0, "距离变化被漏掉");
-        assert_eq!(plan.start_ms, specified_time(1, 8, 20));
+        assert_eq!(plan.start_ms, specified_time(1, 8, 20, plan.dur));
         assert_start_not_future(&plan);
     }
 
@@ -1102,12 +1295,9 @@ mod tests {
         assert_start_not_future(&plan);
     }
 
-    /// 明天（未来）的指定时刻必然被钳制，且界面可据此提示。
-    ///
-    /// 用「未来某天」构造，避免依赖当前钟点（23:xx 跑也不会失效）。
+    /// 今天的未来指定时刻必然被前移，且整段记录不落在未来。
     #[test]
     fn future_specified_time_is_clamped_and_detectable() {
-        // days_ago 取负即未来，但会被 clamp 到 0；这里直接构造今天最后一刻
         let mut p = page(1, 0);
         p.hour = 23;
         p.minute = 59;
@@ -1122,12 +1312,26 @@ mod tests {
             .unwrap()
             .timestamp_millis();
         let now_ms = crate::crypto::envelope::now_ms();
-        assert_eq!(plan.start_ms, typed.min(now_ms));
-        assert_start_not_future(&plan);
-        // 界面提示条件：填入时刻晚于现在（23:59 总成立，除非正好在那一分钟）
-        if typed > now_ms {
+        assert_eq!(
+            plan.start_ms,
+            typed.min(crate::cli::latest_start_ms(now_ms, plan.dur))
+        );
+        assert_stop_not_future(&plan);
+        if typed > crate::cli::latest_start_ms(now_ms, plan.dur) {
             assert!(plan.start_ms < typed, "未来时刻未被钳制");
         }
+    }
+
+    /// 时长修正必须与 flow 同源：超窗时改写，窗口内不动。
+    #[test]
+    fn corrected_dur_matches_flow_speed_window() {
+        let dist = 1000.0;
+        // 10 m/s 远超上界，必须被拉长
+        let fixed = corrected_dur(dist, 100);
+        assert!(fixed > 100, "超速未被修正");
+        assert!(dist / fixed as f64 <= crate::track::generator::SPEED_CEIL);
+        // 6:00/km 在窗口内，不得改动
+        assert_eq!(corrected_dur(dist, 360), 360);
     }
 
     /// 反复调用 ensure_plan 应当是幂等的（不改动任何已定值）。

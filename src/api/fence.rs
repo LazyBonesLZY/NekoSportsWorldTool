@@ -12,7 +12,10 @@ pub const FENCE_PATH: &str = "/api/v1/getGeoFenceForRun";
 
 /// 拉取围栏多边形列表（每个围栏一个闭合环，(lat, lon)，BD-09）。
 pub fn fetch_geo_fence(client: &mut ApiClient) -> Result<Vec<Vec<(f64, f64)>>, String> {
-    let body = json!({ "geoFenceUpdateTime": 0 }).to_string();
+    // 围栏接口的 `geoFenceUpdateTime` 在 IPA 里是**字符串** `"0"`
+    // （`sub_10056A068` 用 `[String: String]` 字面量组字典）；
+    // 注意与 policy 接口的 `geofenceUpdateTime`（小写 f、long 毫秒）是两个不同字段。
+    let body = json!({ "geoFenceUpdateTime": "0" }).to_string();
     let biz = client.call("POST", FENCE_PATH, &body, &[])?;
     let fences = get_field(&biz, "geoFences")
         .and_then(|v| v.as_array())
@@ -54,7 +57,13 @@ pub(crate) fn point_xy(p: &Value) -> Option<(f64, f64)> {
 }
 
 fn field_num(p: &Value, keys: &[&str]) -> Option<f64> {
-    keys.iter().find_map(|k| p.get(*k).and_then(|v| v.as_f64()))
+    // 服务端可能把坐标发成字符串（点位接口就出现过这种形状），这里与
+    // `points::point_coordinate` 保持同样的兼容度，否则围栏会被静默丢成空数组。
+    keys.iter().find_map(|k| {
+        let v = p.get(*k)?;
+        v.as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+    })
 }
 
 #[cfg(test)]

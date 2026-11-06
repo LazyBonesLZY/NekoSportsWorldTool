@@ -4,9 +4,12 @@ pub mod altitude;
 pub mod calorie;
 pub mod generate_road;
 pub mod generator;
+pub mod grade;
+pub mod indoor;
 pub mod geom;
 pub mod model;
 pub mod postfix;
+pub mod reference;
 pub mod wire;
 
 #[cfg(test)]
@@ -113,9 +116,14 @@ mod tests {
             track.totalDistance
         );
         assert_eq!(track.totalTime, 1220);
-        // 点数合理（主 5s 采样）
+        // 点数合理：真机以 3 秒为主采样（真实样本 518 点 / 1056s ≈ 2.0s/点，
+        // 含 31% 的 0 秒暂停重复点；我们无暂停，取 3 秒主导）。
         let n = track.locations.len();
-        assert!((200..320).contains(&n), "n={n}");
+        let per_point = 1220.0 / n as f64;
+        assert!(
+            (2.2..=4.5).contains(&per_point),
+            "n={n} 平均 {per_point:.2}s/点，偏离真机的 3 秒主导采样"
+        );
         // 哨兵：索引0 type∈{0,7}/totalTime=0/state=1；索引1 type=5 全零；末点 type=6
         assert!([0, 7].contains(&track.locations[0].ptype));
         assert_eq!(track.locations[0].totalTime, 0);
@@ -136,19 +144,24 @@ mod tests {
             "末点={}",
             track.locations.last().unwrap().totalDis
         );
-        // 采样间隔：5s 占比 ≥ 60%
-        let mut fives = 0;
+        // 采样间隔：3s 占比 ≥ 60%（真机样本里 3s 占 344/518，是绝对主流）
+        let mut threes = 0;
         let mut total = 0;
         for w in track.locations.windows(2) {
             let dt = w[1].totalTime - w[0].totalTime;
             if dt > 0 {
                 total += 1;
-                if dt == 5 {
-                    fives += 1;
+                if dt == 3 {
+                    threes += 1;
                 }
             }
         }
-        assert!(fives as f64 / total as f64 > 0.6, "5s 占比不足");
+        assert!(
+            threes as f64 / total as f64 > 0.6,
+            "3s 占比不足: {}/{}",
+            threes,
+            total
+        );
         // 10s 窗非空、结构合法
         assert!(!track.speedPerTenSec.is_empty());
         assert_eq!(track.speedPerTenSec.len(), track.stepsPerTenSec.len());
@@ -268,7 +281,7 @@ mod tests {
         }
     }
 
-    /// OBS 对象：10 键、gzip+base64 可解、run_data 27 键点集。
+    /// OBS 对象：11 键、gzip+base64 可解、run_data 22 键点集。
     #[test]
     fn test_obs_object_structure() {
         let pts: Vec<serde_json::Value> = sample_points()
@@ -290,7 +303,7 @@ mod tests {
             1_788_958_186_123,
             &sample_points(),
         );
-        let obj = build_obs_object(&track, 1320403809, "UUID-TEST", 13056447, &pts);
+        let obj = build_obs_object(&track, 1320403809, "UUID-TEST", 13056447, &pts, 7);
         let keys: Vec<&str> = obj
             .as_object()
             .unwrap()
@@ -319,7 +332,8 @@ mod tests {
         use std::io::Read;
         let mut s = String::new();
         dec.read_to_string(&mut s).unwrap();
-        assert_eq!(s, "1320403809");
+        // 真机 buildObsDataWithRrid: 的 rrid 字段恒为 gzip("0")（入参 rrid 未被使用）
+        assert_eq!(s, "0");
         // run_data 解包 → iOS 7.4.0 实机 22 键点集（数值字段为格式化字符串）
         let raw = crate::crypto::envelope::b64_decode(obj["run_data"].as_str().unwrap()).unwrap();
         let mut dec = flate2::read::GzDecoder::new(&raw[..]);
@@ -335,17 +349,18 @@ mod tests {
         assert!(pts[0]["speed"].is_string(), "speed 必须为 \"%.2f\" 字符串");
         assert_eq!(pts[0]["lat"], 0);
         assert_eq!(pts[0]["locType"], 0);
-        // segment_json 是空串 gzip
-        let raw =
-            crate::crypto::envelope::b64_decode(obj["segment_json"].as_str().unwrap()).unwrap();
-        let mut dec = flate2::read::GzDecoder::new(&raw[..]);
-        let mut s = String::new();
-        dec.read_to_string(&mut s).unwrap();
-        assert_eq!(s, "");
-        // obs keys 两个
+        // segment_json / runFaceCheck 无数据时是 "[]" 的 gzip；extension_json 是空串 gzip
+        for (key, expect) in [("segment_json", "[]"), ("runFaceCheck", "[]"), ("extension_json", "")] {
+            let raw = crate::crypto::envelope::b64_decode(obj[key].as_str().unwrap()).unwrap();
+            let mut dec = flate2::read::GzDecoder::new(&raw[..]);
+            let mut s = String::new();
+            dec.read_to_string(&mut s).unwrap();
+            assert_eq!(s, expect, "{key} 解包值不符");
+        }
+        // obs key 只有一个（真机单次 PUT，日期分支 + uuid 文件名）
         let ks = obs_keys(&track, 1320403809, "UUID-TEST");
-        assert_eq!(ks.len(), 2);
+        assert_eq!(ks.len(), 1);
         assert!(ks[0].contains("run_data/"));
-        assert!(ks[1].starts_with("run_data/1320/1320403809.json"));
+        assert!(ks[0].ends_with("/UUID-TEST.json"), "{}", ks[0]);
     }
 }

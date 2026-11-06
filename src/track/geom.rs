@@ -7,6 +7,9 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
 
+/// 赤道子午线度长。**仅**用于 UI 地图的近似投影与旧测试；
+/// 任何参与距离计算的路径都必须用 [`m_per_deg_lat`]，否则在高纬度/低纬度会有
+/// 0.4% 量级的系统性偏差（22.4°N 处 111132 比真值大 0.36%）。
 pub const MET_PER_DEG_LAT: f64 = 111_132.0;
 /// 默认经度米/度（大连纬度 38.9°，向后兼容旧测试）；新代码用 [`m_per_deg_lng`]。
 pub const MET_PER_DEG_LNG: f64 = 86_600.0;
@@ -15,6 +18,24 @@ pub const MET_PER_DEG_LNG: f64 = 86_600.0;
 #[inline]
 pub fn m_per_deg_lng(lat: f64) -> f64 {
     111_320.0 * lat.to_radians().cos()
+}
+
+/// 纬度相关的纬度米/度（WGS-84 子午圈曲率半径展开式）。
+/// 22.4°N ≈ 110736 m/deg，赤道 110574，极点 111694。
+/// 距离计算必须用它：常数 111132 在 22.4°N 会让人以为跑得比实际多 0.36%。
+#[inline]
+pub fn m_per_deg_lat(lat: f64) -> f64 {
+    let p = lat.to_radians();
+    111_132.92 - 559.82 * (2.0 * p).cos() + 1.175 * (4.0 * p).cos()
+}
+
+/// 两点间局部平面距离（米）。以中点纬度取换算系数，短基线误差 < 1e-5。
+#[inline]
+pub fn local_distance_m(a_lat: f64, a_lng: f64, b_lat: f64, b_lng: f64) -> f64 {
+    let lat_ref = (a_lat + b_lat) * 0.5;
+    let dy = (b_lat - a_lat) * m_per_deg_lat(lat_ref);
+    let dx = (b_lng - a_lng) * m_per_deg_lng(lat_ref);
+    dx.hypot(dy)
 }
 
 /// round(x, n)：按精确二进制值四舍五入。
@@ -71,115 +92,8 @@ impl Rng {
 /// 打卡点 BD 系 (lat, lng) → 闭合平面路径 + 弧长表 + 中心。
 pub type PointRing = (Vec<(f64, f64)>, Vec<f64>, (f64, f64));
 
-/// 真实感环线：控制点 = 打卡点 + 切向/径向扰动（各 ≤ 限幅），
-/// 使轨迹从打卡点**旁边**经过而非精确穿心（真机轨迹特征：
-/// 径向 CV ≈ 0.25~0.40，起终点自然错开，轮廓不规整）。
-/// `max_offset_m`：控制点偏离打卡点的最大距离（需 <40m 才能打卡成功）。
-pub fn make_organic_ring(
-    bd_points: &[(f64, f64)],
-    rng: &mut Rng,
-    max_offset_m: f64,
-) -> PointRing {
-    let n = bd_points.len();
-    if n < 3 {
-        return make_point_ring(bd_points);
-    }
-    let cx = bd_points.iter().map(|q| q.0).sum::<f64>() / n as f64;
-    let cy = bd_points.iter().map(|q| q.1).sum::<f64>() / n as f64;
-    let mut ordered = bd_points.to_vec();
-    ordered.sort_by(|a, b| {
-        let ka = (a.0 - cx).atan2(a.1 - cy);
-        let kb = (b.0 - cx).atan2(b.1 - cy);
-        ka.partial_cmp(&kb).unwrap()
-    });
-    // 平面坐标（米）
-    let m_lng = m_per_deg_lng(cx);
-    let plane: Vec<(f64, f64)> = ordered
-        .iter()
-        .map(|q| ((q.1 - cy) * m_lng, (q.0 - cx) * MET_PER_DEG_LAT))
-        .collect();
-
-    // 每个打卡点：沿环切向错位 + 沿径向扰动，合成控制点
-    let mut ctrl: Vec<(f64, f64)> = Vec::with_capacity(n * 2);
-    for i in 0..n {
-        let prev = plane[(i + n - 1) % n];
-        let cur = plane[i];
-        let next = plane[(i + 1) % n];
-        // 切向单位向量（进入方向 + 离开方向平均）
-        let tin = norm2(cur.0 - prev.0, cur.1 - prev.1);
-        let tout = norm2(next.0 - cur.0, next.1 - cur.1);
-        let tx = tin.0 + tout.0;
-        let ty = tin.1 + tout.1;
-        let t = norm2(tx, ty);
-        // 径向单位向量（远离质心）
-        let r = norm2(cur.0, cur.1);
-        // 扰动幅度：切向 ≤ 60% 限幅、径向 ≤ 45% 限幅
-        let tang = rng.uniform(-0.6, 0.6) * max_offset_m;
-        let radi = rng.uniform(-0.45, 0.45) * max_offset_m;
-        let px = cur.0 + t.0 * tang + r.0 * radi;
-        let py = cur.1 + t.1 * tang + r.1 * radi;
-        ctrl.push((px, py));
-
-        // 相邻打卡点之间插入 1 个"拐角"控制点，制造真实场地的直线段/凸起
-        let mx = (cur.0 + next.0) * 0.5;
-        let my = (cur.1 + next.1) * 0.5;
-        let seg = norm2(next.0 - cur.0, next.1 - cur.1);
-        if seg.0.hypot(seg.1) > 25.0 {
-            // 中点相对弦的横向偏移（±18% 弦长，限 22m）
-            let amp = rng.uniform(-0.18, 0.18) * seg.0.hypot(seg.1).min(120.0);
-            let nx = -seg.1;
-            let ny = seg.0;
-            ctrl.push((mx + nx * amp, my + ny * amp));
-        }
-    }
-    if ctrl.len() < 4 {
-        return make_point_ring(bd_points);
-    }
-    let dense = catmull_rom_closed(&ctrl, 14);
-    let arcs = arc_table(&dense);
-    (dense, arcs, (cx, cy))
-}
-
-/// 二维单位化。
-fn norm2(x: f64, y: f64) -> (f64, f64) {
-    let len = x.hypot(y);
-    if len < 1e-9 {
-        (0.0, 0.0)
-    } else {
-        (x / len, y / len)
-    }
-}
-
-/// 闭合 Catmull-Rom 采样。
-fn catmull_rom_closed(ctrl: &[(f64, f64)], samples: usize) -> Vec<(f64, f64)> {
-    let n = ctrl.len();
-    let mut dense = Vec::with_capacity(n * samples);
-    for i in 0..n {
-        let p0 = ctrl[(i + n - 1) % n];
-        let p1 = ctrl[i];
-        let p2 = ctrl[(i + 1) % n];
-        let p3 = ctrl[(i + 2) % n];
-        for j in 0..samples {
-            let t = j as f64 / samples as f64;
-            let (t2, t3) = (t * t, t * t * t);
-            let x = 0.5
-                * ((2.0 * p1.0)
-                    + (-p0.0 + p2.0) * t
-                    + (2.0 * p0.0 - 5.0 * p1.0 + 4.0 * p2.0 - p3.0) * t2
-                    + (-p0.0 + 3.0 * p1.0 - 3.0 * p2.0 + p3.0) * t3);
-            let y = 0.5
-                * ((2.0 * p1.1)
-                    + (-p0.1 + p2.1) * t
-                    + (2.0 * p0.1 - 5.0 * p1.1 + 4.0 * p2.1 - p3.1) * t2
-                    + (-p0.1 + 3.0 * p1.1 - 3.0 * p2.1 + p3.1) * t3);
-            dense.push((x, y));
-        }
-    }
-    dense
-}
-
 /// 闭合路径累积弧长表（长度 = 点数 + 1，末项为总长）。
-fn arc_table(dense: &[(f64, f64)]) -> Vec<f64> {
+pub(super) fn arc_table(dense: &[(f64, f64)]) -> Vec<f64> {
     let mut arcs = vec![0.0f64];
     for i in 1..=dense.len() {
         let a = dense[i - 1];
@@ -413,8 +327,8 @@ impl Stadium {
 }
 
 /// 由打卡点拟合体育场形跑道（PCA 主轴 + 极值包络）。
-/// `fence_bd`：电子围栏顶点（BD 系，可选）——围栏包裹整个操场，
-/// 用它的主轴长度做跑道长轴下界（打卡点未必覆盖跑道全长）。
+/// `fence_bd` 仅为旧调用接口保留，不参与拟合。稀疏打卡点拟合只是估计，
+/// 不代表真实跑道；有实测/描线参考时应优先使用参考。
 /// 返回 (stadium, 弧长表, 稠密采样点) —— 采样点为平面米制。
 pub fn fit_stadium(
     bd_points: &[(f64, f64)],
@@ -523,7 +437,6 @@ pub fn make_stadium_ring(
     (dense, arcs, (c_lat, c_lng))
 }
 
-/// 平面点集的短轴半径估计（最小包围盒短边/2）——漂移幅度上限用。
 #[cfg(test)]
 mod projection_regression_tests {
     use super::*;
@@ -563,28 +476,4 @@ mod projection_regression_tests {
         let (b, _, _) = fit_stadium(&pts, &mut Rng::new(1), Some(&far));
         assert_eq!(a.perimeter(), b.perimeter());
     }
-}
-
-pub fn short_axis_radius(dense: &[(f64, f64)]) -> f64 {
-    if dense.is_empty() {
-        return 40.0;
-    }
-    let (mut sxx, mut syy, mut sxy) = (0.0f64, 0.0f64, 0.0f64);
-    let n = dense.len() as f64;
-    let cx = dense.iter().map(|q| q.0).sum::<f64>() / n;
-    let cy = dense.iter().map(|q| q.1).sum::<f64>() / n;
-    for &(x, y) in dense {
-        let (dx, dy) = (x - cx, y - cy);
-        sxx += dx * dx;
-        syy += dy * dy;
-        sxy += dx * dy;
-    }
-    let rot = 0.5 * (2.0 * sxy).atan2(sxx - syy);
-    let (sn, cs) = rot.sin_cos();
-    let mut w: Vec<f64> = dense
-        .iter()
-        .map(|&(x, y)| ((x - cx) * cs + (y - cy) * sn).abs())
-        .collect();
-    w.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    w[w.len() / 2].max(20.0)
 }

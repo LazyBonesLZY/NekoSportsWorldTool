@@ -66,6 +66,7 @@ pub fn speed_limit_ahead(route: &Route, s: f64, p: &KinParams) -> f64 {
 ///
 /// 最终逐点速度被约束在 `[floor, min(ceil, 弯道限速)]` 内，并等比分摊使总距离
 /// 精确等于 `target_dist`（越界点钳在 cap，剩余差量由未饱和点承担）。
+#[allow(clippy::too_many_arguments)] // 运动学参数显式铺开比打包结构体更易读
 pub fn pace_profile(
     route: &Route,
     v0: f64,

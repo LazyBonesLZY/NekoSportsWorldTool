@@ -1,6 +1,6 @@
 //! AI 运动页：多项目选择 / 按分钟与按次 / 单次提交 / 批量补签。
 
-use super::{mobile, theme, App};
+use super::{mobile, theme, App, JobKind};
 use crate::api::ai::AiMode;
 use eframe::egui;
 
@@ -15,6 +15,8 @@ pub struct AiPage {
     pub per_day: i64,
     /// 勾选的项目 id
     pub picked: Vec<i64>,
+    /// 时长/个数改动后待落盘（拖动中不写盘，松手后一次性写入 config.json）
+    pub pending_save: bool,
 }
 
 /// 批量计划（确认后执行）。
@@ -33,6 +35,8 @@ impl App {
     }
 
     fn draw_ai_content(&mut self, ui: &mut egui::Ui) {
+        // 时长/个数直接写 self.config，这里做一次「改动 → 落盘」，否则关掉程序就丢。
+        let before = (self.config.ai_minutes, self.config.ai_reps);
         ui.add_space(6.0);
 
         // 项目多选
@@ -83,10 +87,17 @@ impl App {
             mobile::drag_i64(ui, "ai_per_day", &mut self.ai_page.per_day, 1..=10, 1.0, "", "");
             ui.end_row();
         });
+        if before != (self.config.ai_minutes, self.config.ai_reps) {
+            self.ai_page.pending_save = true;
+        }
 
         ui.add_space(8.0);
         let logged = self.session.is_some();
-        let one_enabled = !self.ai_busy && logged && !self.ai_page.list.is_empty();
+        let blocked = self.identity_error.is_some();
+        let one_enabled = !self.submission_busy()
+            && logged
+            && !blocked
+            && !self.ai_page.list.is_empty();
         mobile::row(ui, |ui| {
             if ui.add_enabled(one_enabled, theme::primary_btn("提交成绩")).clicked() {
                 let sport_id = self
@@ -97,8 +108,12 @@ impl App {
                     .unwrap_or(0);
                 self.submit_ai_once(sport_id);
             }
-            if self.ai_busy {
+            if self.busy(JobKind::AiSubmit) {
                 ui.label("提交中…");
+            } else if self.busy(JobKind::Run) {
+                ui.label("（跑步提交进行中，暂不可同时提交 AI）");
+            } else if blocked {
+                ui.label("（设备身份不可用）");
             }
         });
 
@@ -121,12 +136,13 @@ impl App {
                 total
             );
             let btn = theme::primary_btn(&batch_label);
+            let can_batch = !self.submission_busy() && logged && !blocked && !picked.is_empty();
             let response = if mobile::compact_ui(ui) {
-                ui.add_enabled_ui(!self.ai_busy && logged && !picked.is_empty(), |ui| {
+                ui.add_enabled_ui(can_batch, |ui| {
                     ui.add_sized([ui.available_width(), mobile::TOUCH_HEIGHT], btn)
                 }).inner
             } else {
-                ui.add_enabled(!self.ai_busy && logged && !picked.is_empty(), btn)
+                ui.add_enabled(can_batch, btn)
             };
             if response.clicked() {
                 self.ai_confirm = Some(AiBatchPlan {
@@ -137,6 +153,17 @@ impl App {
                 });
             }
         });
+
+        if self.busy(JobKind::AiSubmit) {
+            if let Some(flag) = &self.ai_cancel {
+                if !flag.load(std::sync::atomic::Ordering::Relaxed)
+                    && ui.button("取消批量补签").clicked()
+                {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.status = "正在取消批量补签（当前这一条会跑完）…".into();
+                }
+            }
+        }
 
         if let Some(plan) = self.ai_confirm.take() {
             let total = plan.sport_ids.len() as i64 * plan.days * plan.per_day;
@@ -175,6 +202,14 @@ impl App {
                 self.ai_confirm = Some(plan);
             }
         }
+
+        // 指针松开后一次性落盘：拖动过程中不每帧写文件。
+        if self.ai_page.pending_save && !ui.ctx().input(|i| i.pointer.any_down()) {
+            self.ai_page.pending_save = false;
+            if let Err(e) = crate::api::model::save_config(&self.config) {
+                self.status = format!("× AI 参数保存失败：{e}");
+            }
+        }
     }
 
     /// 当前提交意图。
@@ -189,13 +224,20 @@ impl App {
     }
 
     fn submit_ai_once(&mut self, sport_id: i64) {
+        if let Some(err) = &self.identity_error {
+            self.status = format!("设备身份不可用，已阻止提交：{err}");
+            return;
+        }
+        if self.submission_busy() {
+            self.status = "已有提交任务在进行，请等它结束".into();
+            return;
+        }
         let mode = self.ai_mode();
         let (mode_label, score_label, secs, per_min, consume) = ai_display(mode);
         let identity = self.identity.clone();
         let session = self.session.clone().unwrap_or_default();
-        self.ai_busy = true;
         self.status = "AI 成绩提交中…".into();
-        self.spawn_job(move |tx| {
+        self.spawn_job(JobKind::AiSubmit, move |tx| {
             let mut log = App::logger(tx.clone());
             let mut client = crate::api::client::ApiClient::new(identity, Some(session));
             let payload =
@@ -223,19 +265,41 @@ impl App {
 
     /// 批量补签：单线程顺序提交，过去天数取当天 7:00-21:00 随机时刻。
     fn run_ai_batch(&mut self, plan: AiBatchPlan) {
+        if let Some(err) = &self.identity_error {
+            self.status = format!("设备身份不可用，已阻止提交：{err}");
+            return;
+        }
+        if self.submission_busy() {
+            self.status = "已有提交任务在进行，请等它结束".into();
+            return;
+        }
         let identity = self.identity.clone();
         let session = self.session.clone().unwrap_or_default();
-        self.ai_busy = true;
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.ai_cancel = Some(cancel.clone());
         self.status = "批量补签进行中…".into();
-        self.spawn_job(move |tx| {
+        self.spawn_job(JobKind::AiSubmit, move |tx| {
             let mut log = App::logger(tx.clone());
             let mut client = crate::api::client::ApiClient::new(identity, Some(session));
             let total = plan.sport_ids.len() as i64 * plan.days * plan.per_day;
             let mut ok = 0i64;
             let mut done = 0i64;
+            let mut consecutive_fail = 0i64;
+            let mut cancelled = false;
             for day in 0..plan.days {
+                if cancelled {
+                    break;
+                }
                 for _ in 0..plan.per_day {
+                    if cancelled {
+                        break;
+                    }
                     for &sport in &plan.sport_ids {
+                        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            cancelled = true;
+                            log("⚠ 已按要求取消批量补签");
+                            break;
+                        }
                         let at = if day == 0 {
                             None
                         } else {
@@ -246,15 +310,23 @@ impl App {
                         match crate::api::ai::upload(&mut client, sport, plan.mode, at) {
                             Ok(biz) if biz.get("error").and_then(|e| e.as_i64()) == Some(10000) => {
                                 ok += 1;
+                                consecutive_fail = 0;
                                 log(&format!("√ [ai] {tag} sport={sport} 成功（{done}/{total}）"));
                             }
                             Ok(biz) => {
+                                consecutive_fail += 1;
                                 let msg = biz.get("message").and_then(|m| m.as_str()).unwrap_or("");
                                 log(&format!("× [ai] {tag} sport={sport} 失败: {msg}（{done}/{total}）"));
                             }
                             Err(e) => {
+                                consecutive_fail += 1;
                                 log(&format!("× [ai] {tag} sport={sport} 失败: {e}（{done}/{total}）"));
                             }
+                        }
+                        if consecutive_fail >= 5 {
+                            log("× [ai] 连续 5 次失败（可能会话失效或触发风控），已中止批量补签");
+                            cancelled = true;
+                            break;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(1200));
                     }
@@ -265,6 +337,8 @@ impl App {
                 "success": ok, "total": total,
                 "days": plan.days, "per_day": plan.per_day,
                 "sports": plan.sport_ids.len(),
+                "cancelled": cancelled,
+                "done": done,
             });
             tx.send(format!("__AI_DONE__{payload}")).ok();
         });

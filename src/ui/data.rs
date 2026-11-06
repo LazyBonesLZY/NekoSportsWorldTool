@@ -10,7 +10,11 @@ use eframe::egui;
 #[derive(Default)]
 pub struct DataPage {
     pub semester: Option<SemesterSummary>,
+    /// 学期拉取失败原因（与 `semester` 并存：旧数据保留，但状态必须说清）。
+    pub semester_error: Option<String>,
     pub cheat: Option<CheatReport>,
+    /// 违规自查失败原因。有值时无论 `cheat` 是什么都按「未知」渲染。
+    pub cheat_error: Option<String>,
     pub rank_rows: Vec<RankRow>,
     /// 0=个人日 1=个人月 2=班级日 3=班级月 4=院系日 5=院系月 6=室内日 7=室内周 8=室内月 9=历史日 10=历史月
     pub rank_sel: usize,
@@ -56,6 +60,10 @@ impl App {
             .default_open(true)
             .show(ui, |ui| {
                 mobile::row(ui, |ui| {
+                    if let Some(err) = &self.data_page.semester_error {
+                        ui.colored_label(theme::err(), format!("拉取失败：{err}"));
+                        ui.separator();
+                    }
                     match &self.data_page.semester {
                         Some(s) => {
                             let km = |m: f64| format!("{:.2}", m / 1000.0);
@@ -77,7 +85,13 @@ impl App {
                             ui.label("未拉取");
                         }
                     }
-                    if ui.add_enabled(!self.data_busy, theme::primary_btn("刷新")).clicked() {
+                    if ui
+                        .add_enabled(
+                            !self.busy(crate::ui::JobKind::DataSemester),
+                            theme::primary_btn("刷新"),
+                        )
+                        .clicked()
+                    {
                         self.refresh_data_page();
                     }
                 });
@@ -88,6 +102,10 @@ impl App {
             .default_open(true)
             .show(ui, |ui| {
                 mobile::row(ui, |ui| {
+                    if let Some(err) = &self.data_page.cheat_error {
+                        ui.colored_label(theme::err(), format!("自查失败：{err}"));
+                        ui.separator();
+                    }
                     match &self.data_page.cheat {
                         Some(c) => {
                             if c.is_clean() {
@@ -109,7 +127,15 @@ impl App {
                             ui.label("未检查");
                         }
                     }
-                    if ui.add_enabled(!self.data_busy, theme::primary_btn("立即检查")).clicked() {
+                    let cheat_btn = if self.data_page.cheat_error.is_some() {
+                        theme::primary_btn("重试自查")
+                    } else {
+                        theme::primary_btn("立即检查")
+                    };
+                    if ui
+                        .add_enabled(!self.busy(crate::ui::JobKind::DataCheat), cheat_btn)
+                        .clicked()
+                    {
                         self.refresh_cheat_only();
                     }
                 });
@@ -164,11 +190,14 @@ impl App {
                                 ui.selectable_value(&mut self.data_page.rank_sel, i, *opt);
                             }
                         });
-                    if ui.add_enabled(!self.data_busy, theme::primary_btn("查询")).clicked() {
+                    if ui
+                        .add_enabled(!self.data_page_busy(), theme::primary_btn("查询"))
+                        .clicked()
+                    {
                         let (kind, subtype) = self.data_page.selection();
                         self.refresh_rank(kind, subtype);
                     }
-                    if self.data_busy {
+                    if self.data_page_busy() {
                         ui.label("拉取中…");
                     }
                 });

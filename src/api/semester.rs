@@ -25,9 +25,22 @@ pub struct SemesterResult {
     pub personal_raw: Value,
 }
 
+/// 学期汇总接口的请求体：`{sid}`（拿不到 sid 时为空对象）。
+///
+/// IPA `-[SWRunRecordsController _requestSportSummaryDataWithSemester:]` @0x10031f1d8
+/// 的 body 含 `sid`。**所有调用方都必须走这里**——「数据」页与「我的」页调的是同一个
+/// 接口，早前 `user.rs` 用 `{}` 会拿到跨学期的默认汇总。
+pub fn summary_body(client: &ApiClient) -> serde_json::Value {
+    let mut body = json!({});
+    if let Some(sid) = super::records::semester_sid_or_warn(client) {
+        body["sid"] = json!(sid);
+    }
+    body
+}
+
 pub fn query(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> Result<SemesterResult, String> {
-    // 汇总
-    let biz = client.call("POST", SUMMARY_PATH, "{}", &[])?;
+    let body = summary_body(client);
+    let biz = client.call("POST", SUMMARY_PATH, &body.to_string(), &[])?;
     let data = super::client::parse_data_field(&biz);
     let mut summary = SemesterSummary {
         sname: data.get("sname").and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -67,6 +80,7 @@ pub fn query(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> Result<Semest
             .and_then(|rows| rows.first().map(|r| r.rrid));
         if let Some(rrid) = rrid {
             let body = json!({ "rrid": rrid }).to_string();
+            // **必须 POST**（实测 2026-11-06：GET 失败、POST 成功）。
             if let Ok(biz) = client.call("POST", super::user::SEMESTER_COMPLETED_PATH, &body, &[]) {
                 let done = super::client::parse_data_field(&biz);
                 if let Some(n) = done.get("semesterGoalCount").and_then(|v| v.as_i64()) {

@@ -4,9 +4,10 @@
 
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_ANCHOR_LAT: f64 = 38.901678;
-const DEFAULT_ANCHOR_LON: f64 = 121.540241;
-const DEFAULT_CITY: &str = "大连市";
+/// 「尚未配置」哨兵坐标（不是可用的真实位置）。真实配置写在 identity.json 里。
+pub const DEFAULT_ANCHOR_LAT: f64 = 38.901678;
+pub const DEFAULT_ANCHOR_LON: f64 = 121.540241;
+pub const DEFAULT_CITY: &str = "大连市";
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Coordinate {

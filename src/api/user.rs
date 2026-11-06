@@ -50,11 +50,13 @@ pub fn fetch_my_info(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> MyInf
         .map(|biz| parse_data_field(&biz))
         .unwrap_or(Value::Null);
 
+    // 与「数据」页走同一个 body 构造，避免一处带 sid、一处不带的会话不一致。
+    let summary_body = super::semester::summary_body(client);
     let summary = client
         .call(
             "POST",
             super::semester::SUMMARY_PATH,
-            &json!({}).to_string(),
+            &summary_body.to_string(),
             &[],
         )
         .map(|biz| parse_data_field(&biz))
@@ -64,6 +66,8 @@ pub fn fetch_my_info(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> MyInf
     let completed = match super::records::fetch_records(client) {
         Ok(rows) if !rows.is_empty() => client
             .call(
+                // **必须 POST**：实测 2026-11-06，GET 失败、POST 成功。
+                // （早期据"没有 setHTTPMethod: → 默认 GET"改成 GET 是错的。）
                 "POST",
                 SEMESTER_COMPLETED_PATH,
                 &json!({ "rrid": rows[0].rrid }).to_string(),

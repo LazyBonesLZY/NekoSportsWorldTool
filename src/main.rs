@@ -31,6 +31,7 @@ fn free_console() {
 }
 
 #[cfg(not(all(windows, feature = "gui")))]
+#[cfg_attr(not(all(windows, feature = "gui")), allow(dead_code))]
 fn free_console() {}
 
 #[cfg(feature = "gui")]

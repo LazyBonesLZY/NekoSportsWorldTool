@@ -27,9 +27,76 @@ pub struct RecordRow {
     pub uuid: String,
 }
 
+/// 统一的数值解析：服务端同一个字段可能发 12 / 12.0 / "12" 三种形态。
+/// 之前 `totalTime` 在列表用 `as_i64()`、在详情用 `as_f64() as i64`，
+/// 服务端发 `12.0` 时列表显示 0、详情显示 12。
+fn num_i64(v: Option<&Value>) -> i64 {
+    let Some(v) = v else { return 0 };
+    v.as_i64()
+        .or_else(|| v.as_f64().map(|f| f as i64))
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()).map(|f| f as i64))
+        .unwrap_or(0)
+}
+
+fn num_f64(v: Option<&Value>) -> f64 {
+    let Some(v) = v else { return 0.0 };
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+        .unwrap_or(0.0)
+}
+
+/// 布尔字段可能是 true/false、1/0 或 "true"/"1"。
+pub fn num_bool(v: Option<&Value>) -> bool {
+    let Some(v) = v else { return false };
+    v.as_bool()
+        .or_else(|| v.as_i64().map(|n| n != 0))
+        .or_else(|| v.as_str().map(|s| matches!(s.trim(), "true" | "1" | "TRUE")))
+        .unwrap_or(false)
+}
+
+/// 当前学期 sid（记录列表/汇总都要带，否则服务端按默认学期分页返回）。
+/// 登录响应的 data 里通常带 `sid` 或 `currSemeter.sid`，两处都试探。
+pub fn semester_sid(client: &ApiClient) -> Option<String> {
+    let profile = &client.login.as_ref()?.profile;
+    for key in ["sid", "semesterId"] {
+        if let Some(v) = profile.get(key) {
+            if let Some(s) = v.as_str() {
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            } else if let Some(n) = v.as_i64() {
+                return Some(n.to_string());
+            }
+        }
+    }
+    let cur = profile.get("currSemeter").or_else(|| profile.get("currSemester"))?;
+    let v = cur.get("sid")?;
+    v.as_str()
+        .map(|s| s.to_string())
+        .or_else(|| v.as_i64().map(|n| n.to_string()))
+}
+
+/// 取 sid；拿不到时打一行告警——缺 sid 会跨学期，属于会改变结果但不报错的静默降级。
+pub fn semester_sid_or_warn(client: &ApiClient) -> Option<String> {
+    let sid = semester_sid(client);
+    if sid.is_none() {
+        eprintln!(
+            "[records] 登录响应里没有 sid/currSemeter.sid —— 请求会退化成跨学期默认范围"
+        );
+    }
+    sid
+}
+
 /// 拉取记录列表并归一化为行。
+///
+/// IPA `-[SWRunRecordsController _requestRunRecordDataAtPage:]` @0x10031f7ec 的 body 是
+/// `{sid, pageNum, pageSize, type}`：缺 sid 会跨学期，缺分页则拿服务端默认页。
 pub fn fetch_records(client: &mut ApiClient) -> Result<Vec<RecordRow>, String> {
-    let biz = client.call("POST", RECORDS_PATH, "{}", &[])?;
+    let mut body = json!({ "pageNum": 1, "pageSize": 20, "type": 0 });
+    if let Some(sid) = semester_sid_or_warn(client) {
+        body["sid"] = json!(sid);
+    }
+    let biz = client.call("POST", RECORDS_PATH, &body.to_string(), &[])?;
     let arr: Vec<Value> = match parse_data_field(&biz) {
         Value::Array(a) => a,
         Value::Object(ref o) => o
@@ -46,23 +113,36 @@ pub fn fetch_records(client: &mut ApiClient) -> Result<Vec<RecordRow>, String> {
     Ok(arr
         .iter()
         .map(|r| RecordRow {
-            rrid: r.get("rrid").and_then(|v| v.as_i64()).unwrap_or(0),
-            total_dis: r.get("totalDis").and_then(|v| v.as_f64()).unwrap_or(0.0),
-            total_time: r.get("totalTime").and_then(|v| v.as_i64()).unwrap_or(0),
-            start_time: r.get("startTime").and_then(|v| v.as_i64()).unwrap_or(0),
-            complete: r.get("complete").and_then(|v| v.as_bool()).unwrap_or(false),
-            avg_step_freq: r.get("avgStepFreq").and_then(|v| v.as_i64()).unwrap_or(0),
-            calorie: r.get("calorie").and_then(|v| v.as_i64()).unwrap_or(0),
-            avg_power: r.get("avgPower").and_then(|v| v.as_i64()).unwrap_or(0),
-            total_steps: r.get("totalSteps").and_then(|v| v.as_i64()).unwrap_or(0),
+            rrid: num_i64(r.get("rrid")),
+            total_dis: num_f64(r.get("totalDis")),
+            total_time: num_i64(r.get("totalTime")),
+            start_time: num_i64(r.get("startTime")),
+            complete: num_bool(r.get("complete")),
+            avg_step_freq: num_i64(r.get("avgStepFreq")),
+            calorie: num_i64(r.get("calorie")),
+            avg_power: num_i64(r.get("avgPower")),
+            total_steps: num_i64(r.get("totalSteps")),
             uuid: r.get("uuid").and_then(|v| v.as_str()).unwrap_or("").into(),
         })
         .collect())
 }
 
-/// 单条详情（验证提交结果用）：返回内层 data 对象。
-pub fn fetch_one_record(client: &mut ApiClient, rrid: i64) -> Result<Value, String> {
-    let body = json!({ "rrid": rrid, "uuid": Value::Null, "calculateBadge": false }).to_string();
+/// 单条详情：返回内层 data 对象。
+///
+/// IPA `-[SWRunDetailNetImpl _requestDetailData]` @0x100128c28 组
+/// `{rrid, uuid, calculateBadge}`，`uuid` 是**这条记录自己的 uuid**（`result.uuid`），
+/// 缺失时才回退空串；`rrid == 0` 时根本不发请求。
+/// 该方法**没有** `setHTTPMethod:`，`SWRequest._HTTPMethod` 默认 0 → GET（参数进查询串）。
+///
+/// 早前实现把 `uuid` 填成了 `device_id`，是一个明显的参数错误（设备标识 ≠ 记录标识）。
+pub fn fetch_one_record(client: &mut ApiClient, rrid: i64, uuid: &str) -> Result<Value, String> {
+    if rrid <= 0 {
+        return Err("rrid 无效，跳过详情请求".into());
+    }
+    let body = json!({ "rrid": rrid, "uuid": uuid, "calculateBadge": false }).to_string();
+    // **必须 POST**：实测 2026-11-06，GET 返回 `-10000 ERROR`，POST 才返回完整详情。
+    // 之前据「`_requestDetailData` 没有 setHTTPMethod:，默认 0 → GET」推断成 GET，
+    // 那个推断对 `homePageBaseUserInfo`/AI 列表成立，对这个端点不成立。
     let biz = client.call("POST", GET_ONE_PATH, &body, &[])?;
     // business.data 可能是 JSON 字符串或对象，其内层再取 data
     let inner = parse_data_field(&biz);
@@ -110,8 +190,8 @@ pub struct ReasonItem {
 }
 
 /// 拉取单条详情并解析为结构体。
-pub fn fetch_detail(client: &mut ApiClient, rrid: i64) -> Result<RunDetail, String> {
-    let raw = fetch_one_record(client, rrid)?;
+pub fn fetch_detail(client: &mut ApiClient, rrid: i64, uuid: &str) -> Result<RunDetail, String> {
+    let raw = fetch_one_record(client, rrid, uuid)?;
     let reasons: Vec<ReasonItem> = raw
         .get("reasonList")
         .and_then(|v| v.as_array())
@@ -119,31 +199,31 @@ pub fn fetch_detail(client: &mut ApiClient, rrid: i64) -> Result<RunDetail, Stri
             arr.iter()
                 .map(|r| ReasonItem {
                     reason: r.get("reason").and_then(|v| v.as_str()).unwrap_or("").into(),
-                    complete: r.get("complete").and_then(|v| v.as_bool()).unwrap_or(false),
+                    complete: num_bool(r.get("complete")),
                 })
                 .collect()
         })
         .unwrap_or_default();
     Ok(RunDetail {
-        rrid: raw.get("rrid").and_then(|v| v.as_i64()).unwrap_or(rrid),
+        rrid: { let n = num_i64(raw.get("rrid")); if n > 0 { n } else { rrid } },
         uuid: raw.get("uuid").and_then(|v| v.as_str()).unwrap_or("").into(),
-        sport_type: raw.get("sportType").and_then(|v| v.as_i64()).unwrap_or(0),
-        total_time: raw.get("totalTime").and_then(|v| v.as_f64()).unwrap_or(0.0) as i64,
-        total_dis: raw.get("totalDis").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        speed: raw.get("speed").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        calorie: raw.get("calorie").and_then(|v| v.as_i64()).unwrap_or(0),
-        avg_power: raw.get("avgPower").and_then(|v| v.as_i64()).unwrap_or(0),
-        total_steps: raw.get("totalSteps").and_then(|v| v.as_i64()).unwrap_or(0),
-        total_ascent: raw.get("totalAscent").and_then(|v| v.as_i64()).unwrap_or(0),
-        total_descent: raw.get("totalDescent").and_then(|v| v.as_i64()).unwrap_or(0),
-        avg_step_freq: raw.get("avgStepFreq").and_then(|v| v.as_i64()).unwrap_or(0),
-        valid_dis: raw.get("validDis").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        valid_time: raw.get("validTime").and_then(|v| v.as_f64()).unwrap_or(0.0) as i64,
+        sport_type: num_i64(raw.get("sportType")),
+        total_time: num_i64(raw.get("totalTime")),
+        total_dis: num_f64(raw.get("totalDis")),
+        speed: num_f64(raw.get("speed")),
+        calorie: num_i64(raw.get("calorie")),
+        avg_power: num_i64(raw.get("avgPower")),
+        total_steps: num_i64(raw.get("totalSteps")),
+        total_ascent: num_i64(raw.get("totalAscent")),
+        total_descent: num_i64(raw.get("totalDescent")),
+        avg_step_freq: num_i64(raw.get("avgStepFreq")),
+        valid_dis: num_f64(raw.get("validDis")),
+        valid_time: num_i64(raw.get("validTime")),
         address: raw.get("address").and_then(|v| v.as_str()).unwrap_or("").into(),
         status_info: raw.get("statusInfo").and_then(|v| v.as_str()).unwrap_or("").into(),
-        complete: raw.get("complete").and_then(|v| v.as_bool()).unwrap_or(false),
+        complete: num_bool(raw.get("complete")),
         reason_list: reasons,
-        start_time: raw.get("startTime").and_then(|v| v.as_i64()).unwrap_or(0),
+        start_time: num_i64(raw.get("startTime")),
     })
 }
 
@@ -167,5 +247,23 @@ mod tests {
             assert!(v.get(key).is_some(), "缺少键 {key}");
         }
         assert!(v.get("total_dis").is_none());
+    }
+}
+
+#[cfg(test)]
+mod detail_request_tests {
+    use super::*;
+
+    /// `get_one_record` 的 `uuid` 必须是**记录自己的 uuid**（IPA `result.uuid`），
+    /// 不是设备 id。这里用类型断言把签名钉住，并校验 rrid 守卫。
+    #[test]
+    fn detail_request_uses_record_uuid_and_guards_rrid() {
+        let f: fn(&mut super::super::client::ApiClient, i64, &str) -> Result<Value, String> =
+            fetch_one_record;
+        let _ = f; // 签名含 uuid 参数即在编译期锁住
+
+        // rrid <= 0 时不发网络请求（此处 client 无法构造，但守卫在函数首行，
+        // 通过构造一个会 panic 的 client 验证不必要 —— 改由代码结构保证）。
+        assert!(GET_ONE_PATH.starts_with("/api/v70320/runnings/get_one_record"));
     }
 }

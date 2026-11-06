@@ -136,8 +136,17 @@ pub fn key_data_four_from_ms(now_ms_f64: f64) -> String {
     normalize_raw_key_data(&formatted)
 }
 
-/// NTESSecurityKit singleton 会话：Four 首次生成后整个会话复用。
+/// 进程级 keyDataFour。
+///
+/// 真机是 NTESSecurityKit 单例：**一个进程只有一个 Four**，与创建多少个网络客户端无关。
+/// 本工具的 UI 会为每个后台任务各建一个 `ApiClient`，若 Four 跟着实例走，同一账号
+/// 在几秒内就会向服务端呈现 4–6 个不同的 keyDataFour（inner container 明文字段），
+/// 这是可直接交叉校验的指纹矛盾。因此把 Four 提升为进程级单例。
+static PROCESS_FOUR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// NTESSecurityKit singleton 会话：Four 首次生成后整个**进程**复用。
 pub struct EnvelopeSession {
+    /// 仅用于测试注入固定 Four；生产路径走 `PROCESS_FOUR`。
     four: Option<String>,
 }
 
@@ -152,22 +161,30 @@ impl EnvelopeSession {
         Self { four: None }
     }
 
-        pub fn key_data(&mut self) -> [String; 4] {
-        if self.four.is_none() {
-            self.four = Some(key_data_four_from_ms(now_ms() as f64));
-        }
+    pub fn key_data(&mut self) -> [String; 4] {
+        let four = match &self.four {
+            Some(f) => f.clone(),
+            None => PROCESS_FOUR
+                .get_or_init(|| key_data_four_from_ms(now_ms() as f64))
+                .clone(),
+        };
         [
             KEYDATA_ONE.to_string(),
             KEYDATA_TWO.to_string(),
             KEYDATA_THREE.to_string(),
-            self.four.clone().unwrap(),
+            four,
         ]
     }
 
-    /// 测试注入固定 Four。
+    /// 测试注入固定 Four（不影响进程级单例）。
     #[allow(dead_code)]
     pub fn with_four(four: &str) -> Self {
         Self { four: Some(four.to_string()) }
+    }
+
+    /// 进程级 Four 的当前值（尚未生成时为 None）。诊断/日志用。
+    pub fn process_four() -> Option<String> {
+        PROCESS_FOUR.get().cloned()
     }
 }
 
@@ -303,6 +320,22 @@ mod tests {
         assert!(short.starts_with("abc"));
     }
 
+    /// 不同 `EnvelopeSession` 实例必须复用同一个进程级 Four —— 这是"同一设备一个会话"
+    /// 的核心不变量，多实例各自派生 Four 会被服务端聚成多台设备。
+    #[test]
+    fn all_sessions_share_one_process_level_four() {
+        let mut a = EnvelopeSession::new();
+        let mut b = EnvelopeSession::new();
+        let f1 = a.key_data()[3].clone();
+        let f2 = b.key_data()[3].clone();
+        assert_eq!(f1, f2, "同一进程内所有 EnvelopeSession 必须共用同一个 keyDataFour");
+        assert_eq!(f1.len(), 12);
+        assert_eq!(EnvelopeSession::process_four().as_deref(), Some(f1.as_str()));
+        // 测试注入仍然独立
+        let mut t = EnvelopeSession::with_four("86123.456789");
+        assert_eq!(t.key_data()[3], "86123.456789");
+    }
+
     /// 完整信封构造→反解 roundtrip（本地验证，无需网络/私钥）。
     #[test]
     fn test_envelope_roundtrip() {
@@ -366,5 +399,60 @@ mod key_provenance_tests {
         // 常量 PEM 可解析（from_public_key_pem 已在 rsa_public_key() 内断言）
         // 容器1 密钥串长度语义：WHSimulateIDFA 同为 32 字符 hex
         assert_eq!(CONTAINER1_KEY_HEX.len(), 32);
+    }
+}
+
+#[cfg(test)]
+mod key_order_tests {
+    use super::*;
+
+    /// inner container 的键序必须与真机插入序一致：
+    /// `data, timeStamp, platform, keyDataOne, keyDataTwo, keyDataThree, keyDataFour`。
+    ///
+    /// 这不是美观问题：`h = MD5(container 字节)`，服务端若按「解密后解析再重序列化」
+    /// 的方式复算 h，键序不同就会直接判信封非法。而 serde_json 只有在启用
+    /// `preserve_order`（indexmap 支撑）时才保序，默认是 BTreeMap 会按键名排序——
+    /// 那种情况下顺序会变成 data/keyDataFour/keyDataOne/... 本测试会立刻失败。
+    #[test]
+    fn container_key_order_matches_ipa_insertion_order() {
+        let kd = [
+            "nhang.school".to_string(),
+            "5K0E8400-E29".to_string(),
+            "597DEA1AFB49".to_string(),
+            "86123.456789".to_string(),
+        ];
+        let bytes = serialize_container("QUJD", 1_700_000_000_000, &kd);
+        let text = String::from_utf8(bytes).unwrap();
+        let keys = [
+            "\"data\"",
+            "\"timeStamp\"",
+            "\"platform\"",
+            "\"keyDataOne\"",
+            "\"keyDataTwo\"",
+            "\"keyDataThree\"",
+            "\"keyDataFour\"",
+        ];
+        let positions: Vec<usize> = keys
+            .iter()
+            .map(|k| text.find(k).unwrap_or_else(|| panic!("container 缺 {k}: {text}")))
+            .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "container 键序不是插入序（可能没开 serde_json 的 preserve_order）: {text}"
+        );
+        // 明确排除字典序（keyDataFour 会排到 keyDataOne 前面）
+        assert!(
+            text.find("keyDataOne").unwrap() < text.find("keyDataFour").unwrap(),
+            "键序退化成字典序: {text}"
+        );
+    }
+
+    /// 外层信封两种固定键序。
+    #[test]
+    fn outer_envelope_key_orders_are_fixed() {
+        let obs = serialize_envelope_fields("d", "h", "k", OuterOrder::Observed);
+        assert_eq!(obs, "{\"k\":\"k\",\"p\":101,\"d\":\"d\",\"h\":\"h\",\"t\":0}");
+        let ins = serialize_envelope_fields("d", "h", "k", OuterOrder::Insert);
+        assert_eq!(ins, "{\"d\":\"d\",\"h\":\"h\",\"k\":\"k\",\"p\":101,\"t\":0}");
     }
 }

@@ -18,12 +18,12 @@ impl App {
         ui.add_space(6.0);
         mobile::row(ui, |ui| {
             if ui
-                .add_enabled(!self.user_busy, theme::primary_btn("刷新"))
+                .add_enabled(!self.busy(crate::ui::JobKind::User), theme::primary_btn("刷新"))
                 .clicked()
             {
                 self.refresh_user_page();
             }
-            if self.user_busy {
+            if self.busy(crate::ui::JobKind::User) {
                 ui.label("拉取中…");
             }
         });

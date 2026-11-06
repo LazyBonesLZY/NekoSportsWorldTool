@@ -3,9 +3,13 @@
 //! 后台任务与消息处理在独立 impl App 块中。
 //!
 //! 线程模型：所有网络/长任务 spawn thread + mpsc channel<String> 回 UI，
-//! 带 200ms 轮询重绘。带内消息协议：
-//! __IP_DONE__ / __LOGIN_DONE__ / __RUN_DONE__ / __AI_DONE__ / __RECORDS__ / __AI_LIST__
-//! __SEMESTER__ / __CHEAT__ / __RANK__ / __USER__ / __AI_RECORDS__
+//! 带 200ms 轮询重绘。带内消息协议（除进度/日志外一律是 `{"ok":bool,...}`）：
+//! __IP_DONE__ / __LOGIN_DONE__ / __LOGOUT_DONE__ / __RUN_DONE__ / __AI_DONE__ /
+//! __RECORDS__ / __AI_LIST__ / __SEMESTER__ / __CHEAT__ / __RANK__ / __USER__ /
+//! __AI_RECORDS__ / __FENCE_DONE__ / __POINTS_DONE__
+//!
+//! 忙标志按任务类型记账（`in_flight`），每个任务只清自己那一项；线程 panic 由
+//! `spawn_job` 的 `catch_unwind` 兜底发一条 `ok=false`，另有超时第二道保险。
 
 pub mod about;
 pub mod ai;
@@ -25,11 +29,14 @@ pub mod user;
 
 use crate::api::model::{self, Config, HeaderIdentity, Session};
 use eframe::egui;
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub const IP: &str = "__IP_DONE__";
 pub const LOGIN_DONE: &str = "__LOGIN_DONE__";
+pub const LOGOUT_DONE: &str = "__LOGOUT_DONE__";
 pub const RUN_DONE: &str = "__RUN_DONE__";
 pub const AI_DONE: &str = "__AI_DONE__";
 pub const RECORDS: &str = "__RECORDS__";
@@ -53,6 +60,104 @@ pub struct PopupInfo {
     pub lines: Vec<String>,
 }
 
+/// 后台任务类型：忙标志、超时兜底与消息回收都以它为单位。
+///
+/// 旧实现用 6 个全局 bool，导致 `AI_LIST` 会清掉正在提交的 AI、`SEMESTER` 会
+/// 提前放行排行榜查询。按任务类型记账后，每个任务只清自己那一项。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum JobKind {
+    Login,
+    Logout,
+    Ip,
+    Run,
+    AiSubmit,
+    AiList,
+    AiRecords,
+    Records,
+    RunDetail,
+    AiDetail,
+    User,
+    DataSemester,
+    DataCheat,
+    Rank,
+    Fence,
+    Points,
+    UpdateCheck,
+    UpdateDownload,
+}
+
+impl JobKind {
+    /// 该任务对应的完成消息前缀（panic 兜底也用它解锁 UI）。
+    pub fn done_prefix(self) -> &'static str {
+        match self {
+            JobKind::Login => LOGIN_DONE,
+            JobKind::Logout => LOGOUT_DONE,
+            JobKind::Ip => IP,
+            JobKind::Run => RUN_DONE,
+            JobKind::AiSubmit => AI_DONE,
+            JobKind::AiList => AI_LIST,
+            JobKind::AiRecords => AI_RECORDS,
+            JobKind::Records => RECORDS,
+            JobKind::RunDetail => RUN_DETAIL,
+            JobKind::AiDetail => AI_DETAIL,
+            JobKind::User => USER,
+            JobKind::DataSemester => SEMESTER,
+            JobKind::DataCheat => CHEAT,
+            JobKind::Rank => RANK,
+            JobKind::Fence => FENCE_DONE,
+            JobKind::Points => POINTS_DONE,
+            JobKind::UpdateCheck => UPDATE_CHK,
+            JobKind::UpdateDownload => UPDATE_DONE,
+        }
+    }
+
+    /// 无响应超时：超过即解除界面锁定（线程卡死/panic 未捕获时的第二道保险）。
+    pub fn timeout(self) -> Duration {
+        match self {
+            JobKind::Login | JobKind::AiSubmit | JobKind::UpdateDownload => Duration::from_secs(300),
+            JobKind::Run => Duration::from_secs(240),
+            JobKind::UpdateCheck | JobKind::Ip => Duration::from_secs(60),
+            _ => Duration::from_secs(180),
+        }
+    }
+
+    /// 界面文案用的任务名。
+    pub fn label(self) -> &'static str {
+        match self {
+            JobKind::Login => "登录",
+            JobKind::Logout => "登出",
+            JobKind::Ip => "公网 IP 获取",
+            JobKind::Run => "跑步提交",
+            JobKind::AiSubmit => "AI 提交",
+            JobKind::AiList => "AI 项目列表",
+            JobKind::AiRecords => "AI 记录",
+            JobKind::Records => "跑步记录",
+            JobKind::RunDetail => "跑步详情",
+            JobKind::AiDetail => "AI 记录详情",
+            JobKind::User => "我的页数据",
+            JobKind::DataSemester => "学期完成度",
+            JobKind::DataCheat => "违规自查",
+            JobKind::Rank => "排行榜",
+            JobKind::Fence => "电子围栏",
+            JobKind::Points => "实时点位",
+            JobKind::UpdateCheck => "检查更新",
+            JobKind::UpdateDownload => "下载更新",
+        }
+    }
+
+    /// 更新前需要等待的「前台」任务（纯后台拉取不挡更新）。
+    pub fn blocks_update(self) -> bool {
+        !matches!(
+            self,
+            JobKind::Ip
+                | JobKind::Fence
+                | JobKind::Points
+                | JobKind::UpdateCheck
+                | JobKind::UpdateDownload
+        )
+    }
+}
+
 /// 顶层 App。
 pub struct App {
     pub tx: Sender<String>,
@@ -65,19 +170,19 @@ pub struct App {
     pub device_buf: HeaderIdentity,
     pub session: Option<Session>,
     pub config: Config,
+    /// 设备身份读取失败的原因；有值时禁用登录/提交，只允许「备份并重建身份」。
+    pub identity_error: Option<String>,
 
     pub username: String,
     pub password: String,
     pub remember: bool,
-    pub login_busy: bool,
-    pub run_busy: bool,
-    pub ai_busy: bool,
-    pub records_busy: bool,
-    pub data_busy: bool,
-    pub user_busy: bool,
+    /// 按任务类型的在跑任务（值是开始时刻，供超时兜底）。
+    pub in_flight: HashMap<JobKind, Instant>,
     pub status: String,
     pub popup: Option<PopupInfo>,
     pub ai_confirm: Option<ai::AiBatchPlan>,
+    /// 批量补签的取消位（`None` = 没有批量任务在跑）。
+    pub ai_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 
     pub tab: usize,
     pub run_page: run::RunPage,
@@ -107,9 +212,9 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_messages();
-        #[cfg(target_os = "android")]
-        self.poll_device_info();
-        crate::platform::set_keep_screen_on(self.run_busy || self.ai_busy || self.login_busy);
+        // 线程卡死/未捕获异常的第二道保险：超时即解锁界面。
+        self.expire_stale_jobs();
+        crate::platform::set_keep_screen_on(self.submission_busy() || self.busy(JobKind::Login));
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
 
         // ── 顶栏 ────────────────────────────────────────────────
@@ -118,7 +223,28 @@ impl eframe::App for App {
             let compact = mobile::compact_ui(ui);
             let logged = self.session.is_some();
             let btn_text = if logged { "登出" } else { "登录" };
+            let id_ok = self.identity_error.is_none();
             let mut login_clicked = false;
+            let mut rebuild_clicked = false;
+            // 设备身份读取失败：硬阻断登录与提交，只留「备份并重建身份」。
+            if let Some(err) = self.identity_error.clone() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(theme::err(), format!("× 设备身份读取失败：{err}"));
+                    if ui
+                        .add_enabled(
+                            !self.busy(JobKind::Login),
+                            egui::Button::new("备份并重建身份"),
+                        )
+                        .clicked()
+                    {
+                        rebuild_clicked = true;
+                    }
+                });
+                ui.colored_label(
+                    theme::warn(),
+                    "已停止一切网络操作：继续用空 DeviceId 请求会让服务端判定设备异常（10121）。",
+                );
+            }
             let draw_connection = |ui: &mut egui::Ui| {
                 ui.label("IP：");
                 if self.ip.is_empty() {
@@ -139,7 +265,7 @@ impl eframe::App for App {
             };
             if compact {
                 ui.horizontal_wrapped(draw_connection);
-                ui.label(format!("设备：{}", self.identity.device_id));
+                ui.label(format!("设备：{}", device_text(&self.identity.device_id)));
                 ui.add_space(4.0);
                 ui.label("账号：");
                 mobile::text_edit(
@@ -160,7 +286,10 @@ impl eframe::App for App {
                 ui.horizontal_wrapped(|ui| {
                     ui.checkbox(&mut self.remember, "记住密码");
                     login_clicked = ui
-                        .add_enabled(!self.login_busy, theme::primary_btn(btn_text))
+                        .add_enabled(
+                            !self.busy(JobKind::Login) && id_ok,
+                            theme::primary_btn(btn_text),
+                        )
                         .clicked();
                 });
             } else {
@@ -170,7 +299,7 @@ impl eframe::App for App {
                     .show(ui, |ui| {
                         draw_connection(ui);
                         ui.label("设备：");
-                        ui.monospace(&self.identity.device_id);
+                        ui.monospace(device_text(&self.identity.device_id));
                         ui.end_row();
                     });
                 ui.add_space(3.0);
@@ -196,12 +325,17 @@ impl eframe::App for App {
                         );
                         ui.checkbox(&mut self.remember, "记住密码");
                         login_clicked = ui
-                            .add_enabled(!self.login_busy, theme::primary_btn(btn_text))
+                            .add_enabled(
+                                !self.busy(JobKind::Login) && id_ok,
+                                theme::primary_btn(btn_text),
+                            )
                             .clicked();
                         ui.end_row();
                     });
             }
-            if login_clicked {
+            if rebuild_clicked {
+                self.rebuild_identity();
+            } else if login_clicked {
                 if logged {
                     self.do_logout();
                 } else {
@@ -223,7 +357,9 @@ impl eframe::App for App {
                         s.sname, s.semester_valid_count, s.semester_count
                     ));
                 }
-                if let Some(c) = &self.data_page.cheat {
+                if let Some(err) = &self.data_page.cheat_error {
+                    ui.colored_label(theme::err(), format!("自查失败：{err}"));
+                } else if let Some(c) = &self.data_page.cheat {
                     if c.is_clean() {
                         ui.colored_label(theme::ok(), "自查正常");
                     } else {
@@ -314,7 +450,11 @@ impl App {
         let (net_tx, net_rx) = std::sync::mpsc::channel();
         let font_loaded = fonts::install(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx);
-        let identity = model::load_identity();
+        // 严格读取：读不出来就硬阻断（空 DeviceId 会让每个请求换一个随机设备号）。
+        let (identity, identity_error) = match model::try_load_identity() {
+            Ok(id) => (id, None),
+            Err(e) => (HeaderIdentity::default(), Some(e)),
+        };
         let device_buf = identity.clone();
         let session = model::load_session();
         let config = model::load_config();
@@ -330,20 +470,17 @@ impl App {
             ip: String::new(),
             identity,
             device_buf,
+            identity_error,
             session: session.is_logged_in().then_some(session),
             config: config.clone(),
             username,
             password,
             remember,
-            login_busy: false,
-            run_busy: false,
-            ai_busy: false,
-            records_busy: false,
-            data_busy: false,
-            user_busy: false,
+            in_flight: HashMap::new(),
             status: "就绪".into(),
             popup: None,
             ai_confirm: None,
+            ai_cancel: None,
             tab: 0,
             run_page: run::RunPage {
                 dist_min: config.dist_min,
@@ -355,18 +492,18 @@ impl App {
                     .map(|r| format!("{}-{}", r.min_m, r.max_m))
                     .or_else(|| config.manual_altitude.map(|v| v.to_string()))
                     .unwrap_or_default(),
-                start_mode: 0,
-                days_ago: 0,
-                hour: 12,
-                minute: 0,
+                start_mode: config.start_mode.clamp(0, 1) as usize,
+                days_ago: config.days_ago.clamp(0, 3),
+                hour: config.hour.clamp(0, 23),
+                minute: config.minute.clamp(0, 59),
                 face_check: config.face_check,
                 plan: None,
-                route_mode: crate::track::generate_road::RouteMode::from_str(&config.route_mode),
-                submit_ios: config.submit_form.eq_ignore_ascii_case("ios"),
+                route_mode: crate::track::generate_road::RouteMode::parse(&config.route_mode),
                 map: map::MapState::default(),
                 preview: None,
                 preview_stale: true,
                 map_fitted: false,
+                pending_save: false,
             },
             ai_page: ai::AiPage {
                 days: 1,
@@ -390,7 +527,13 @@ impl App {
             app.log
                 .push("未找到中文字体（msyh/simhei/simsun），界面中文可能显示为方块");
         }
-        // 上次更新残留的 .old/.new 顺手清掉
+        if let Some(err) = app.identity_error.clone() {
+            app.log
+                .push(&format!("× 设备身份读取失败：{err}（已停止网络操作，请在设备页「备份并重建身份」）"));
+            app.status = "设备身份读取失败，已停止网络操作".into();
+            app.tab = 5;
+        }
+        // 上次更新残留的 .old/.new 按「新版本是否已成功启动」决定是否清掉
         crate::update::cleanup_residue();
         // 启动检查更新（silent 静默 / ask 询问 / off 关闭）
         match app.config.update_check.as_str() {
@@ -399,11 +542,9 @@ impl App {
             _ => app.check_update(false),
         }
         app.fetch_ip();
-        #[cfg(target_os = "android")]
-        crate::android::request_device_info(true);
         // AI 项目列表先上缓存，网络刷新后覆盖
         app.ai_page.list = crate::api::model::load_ai_sports().unwrap_or_default();
-        if app.session.is_some() {
+        if app.session.is_some() && app.identity_error.is_none() {
             app.refresh_data_page();
             app.refresh_records();
             app.refresh_user_page();
@@ -419,18 +560,147 @@ impl App {
         app
     }
 
-    /// 后台任务（线程 + 日志 channel）。
-    pub fn spawn_job<F>(&self, f: F)
+    /// 后台任务（线程 + 日志 channel），带 panic 兜底。
+    ///
+    /// `f` panic 时线程会静默死掉，旧实现在这种情况下 busy 标志永远不解除。
+    /// 这里用 `catch_unwind` 兜住，**无论成败都补发一条 `ok=false` 的完成消息**，
+    /// 保证界面一定能解锁；另有一层 `expire_stale_jobs` 超时兜底。
+    pub fn spawn_job<F>(&mut self, kind: JobKind, f: F)
     where
         F: FnOnce(Sender<String>) + Send + 'static,
     {
+        self.mark(kind);
         let tx = self.tx.clone();
-        std::thread::spawn(move || f(tx));
+        let guard = tx.clone();
+        std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(tx)));
+            if outcome.is_err() {
+                let payload = serde_json::json!({
+                    "ok": false,
+                    "message": "内部错误（后台线程异常退出），已解除界面锁定",
+                });
+                let _ = guard.send(format!("{}{}", kind.done_prefix(), payload));
+                let _ = guard.send(format!("× {} 后台线程异常退出", kind.label()));
+            }
+        });
+    }
+
+    // ── 在跑任务记账 ────────────────────────────────────────────
+
+    pub fn busy(&self, kind: JobKind) -> bool {
+        self.in_flight.contains_key(&kind)
+    }
+
+    pub fn mark(&mut self, kind: JobKind) {
+        self.in_flight.insert(kind, Instant::now());
+    }
+
+    pub fn clear(&mut self, kind: JobKind) {
+        self.in_flight.remove(&kind);
+    }
+
+    /// 提交类任务互斥：跑步与 AI 提交不能同时进行（只读刷新不受影响）。
+    pub fn submission_busy(&self) -> bool {
+        self.busy(JobKind::Run) || self.busy(JobKind::AiSubmit)
+    }
+
+    /// 数据页三个动作共用一把锁：cheat 还在飞时不许查询排行榜。
+    pub fn data_page_busy(&self) -> bool {
+        self.busy(JobKind::DataSemester)
+            || self.busy(JobKind::DataCheat)
+            || self.busy(JobKind::Rank)
+    }
+
+    /// 记录页两路刷新共用一把锁。
+    pub fn records_busy(&self) -> bool {
+        self.busy(JobKind::Records) || self.busy(JobKind::AiRecords)
+    }
+
+    /// 任意前台任务在跑（更新前的打断保护）。
+    pub fn any_busy(&self) -> bool {
+        self.in_flight.keys().any(|k| k.blocks_update())
+    }
+
+    /// 超时兜底：超过该任务类型的超时时间仍无完成消息 → 解除锁定并提示。
+    pub fn expire_stale_jobs(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<JobKind> = self
+            .in_flight
+            .iter()
+            .filter(|(kind, started)| now.duration_since(**started) > kind.timeout())
+            .map(|(kind, _)| *kind)
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        for kind in expired {
+            self.in_flight.remove(&kind);
+            match kind {
+                JobKind::UpdateCheck => self.update.checking = false,
+                JobKind::UpdateDownload => self.update.downloading = false,
+                JobKind::RunDetail => self.records_page.detail_loading = false,
+                JobKind::AiDetail => self.records_page.ai_detail_loading = false,
+                JobKind::AiSubmit => self.ai_cancel = None,
+                _ => {}
+            }
+            let note = format!(
+                "⚠ {} 超过 {}s 没有响应，已解除界面锁定（后台线程可能仍在运行，请勿重复提交）",
+                kind.label(),
+                kind.timeout().as_secs()
+            );
+            self.log.push(&note);
+            self.status = format!("{} 超时，已解除锁定", kind.label());
+        }
+    }
+
+    /// 设备身份损坏时的恢复路径：原文件改名为 `identity.json.corrupt-<时间戳>`，
+    /// 再按「文件不存在」路径重新生成一套身份（DeviceId/IDFA 只生成一次并落盘）。
+    pub fn rebuild_identity(&mut self) {
+        let dir = crate::platform::data_dir();
+        let src = dir.join("identity.json");
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let backup = dir.join(format!("identity.json.corrupt-{stamp}"));
+        match std::fs::rename(&src, &backup) {
+            Ok(()) => {
+                self.log
+                    .push(&format!("√ 已备份损坏的身份文件到 {}", backup.display()));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                self.status = format!("× 备份身份文件失败：{e}");
+                return;
+            }
+        }
+        match model::try_load_identity() {
+            Ok(id) => {
+                self.identity = id.clone();
+                self.device_buf = id;
+                self.identity_error = None;
+                self.log
+                    .push("√ 已重建设备身份（DeviceId/IDFA 已重新生成并落盘）");
+                self.log
+                    .push("⚠ 城市与定位锚点是默认值，请到设备信息页填写真实位置后再跑步");
+                self.status = "√ 设备身份已重建".into();
+            }
+            Err(e) => {
+                self.identity_error = Some(e.clone());
+                self.status = format!("× 重建身份失败：{e}");
+            }
+        }
     }
 
     pub fn logger(tx: Sender<String>) -> impl FnMut(&str) {
         move |s: &str| {
             tx.send(s.to_string()).ok();
         }
+    }
+}
+
+/// 顶栏设备号展示：身份未读出来时给一句人话，而不是一片空白。
+fn device_text(device_id: &str) -> &str {
+    if device_id.trim().is_empty() {
+        "（未读取，见上方错误）"
+    } else {
+        device_id
     }
 }

@@ -93,7 +93,19 @@ pub fn fetch_info(client: &mut ApiClient, sport_id: i64) -> Result<SportInfo, St
 /// 计时类（type=2）score=用时毫秒、speed=每分钟个数、消耗=秒×0.2；坐位体前屈消耗为 0。
 pub fn upload(client: &mut ApiClient, sport_id: i64, mode: AiMode, at: Option<i64>) -> Result<Value, String> {
     let now = crate::crypto::envelope::now_ms();
-    let info = fetch_info(client, sport_id).unwrap_or(SportInfo { sport_type: 1, number: 0 });
+    // `/api/v1/sport/ai/info` 在 7.4.0 二进制里**没有任何调用点**（selector 只有 selref +
+    // method-list 两个引用）。仍保留调用是因为它还能给出 score 单位（计次/计时），
+    // 但失败时必须显式告警——静默按计次类处理会把计时类项目写成错误单位。
+    let info = match fetch_info(client, sport_id) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!(
+                "[ai] 拉取项目 {sport_id} 类型失败（{e}），按计次类(type=1)提交；\
+                 若该项目是计时类，本条成绩单位会错"
+            );
+            SportInfo { sport_type: 1, number: 0 }
+        }
+    };
     let jitter = 0.9 + rand::random::<f64>() * 0.2; // ±10%
 
     // 计次类持续频率（个/分）与计时类单次耗时（毫秒）——取自真人记录区间
@@ -128,7 +140,9 @@ pub fn upload(client: &mut ApiClient, sport_id: i64, mode: AiMode, at: Option<i6
         format!("{consume:.1}")
     };
     let score_date = at.unwrap_or(now - time_consume);
-    // 7.4.0 实机 10 键 body：sportId/type/score/timeConsume/speed/consume/上传视频地址/""(占位)/uuid/scoreDate/taskId
+    // 7.4.0 实机 **9 键** body（builder `sub_1006751EC` 的 swift_arrayDestroy(count: 9) 印证）：
+    // sportId / type / score / timeConsume / speed / consume / 上传视频地址 / uuid / scoreDate。
+    // `taskId` 在二进制里只被个推 SDK 使用，与本接口无关，已移除。
     let body = json!({
         "sportId": sport_id,
         "type": body_type,
@@ -139,7 +153,6 @@ pub fn upload(client: &mut ApiClient, sport_id: i64, mode: AiMode, at: Option<i6
         "上传视频地址": "",
         "uuid": uuid::Uuid::new_v4().to_string(),
         "scoreDate": score_date,
-        "taskId": 0,
     });
     client.call("POST", AI_UPLOAD_PATH, &body.to_string(), &[])
 }

@@ -1,134 +1,31 @@
-//! Android 跑步提交签名。
+//! iOS 7.4.0 跑步提交签名。
 //!
-//! UploadSignEntity 31 字段固定顺序（+sportType=3 的 roomId）；
-//! Java String.valueOf 字符串化；signature=MD5(忽略大小写排序拼接 + 盐)、
-//! originalSign=自然序拼接（无 MD5 无盐）。
+//! 语义来自 IPA `SWEncryption.signObjectWithoutEncoding:suffix:` 与
+//! `NSDictionary sortedQueryStringWithoutEncoding`：
+//! 键按 lowercaseString 比较排序、值取 `[obj description]`、
+//! signature = MD5(query + 盐)，originalSign = 同一 query 明文。
 
 use super::envelope::md5_hex;
 
 pub const SALT: &str = "2slhe02lsfiwowlcixisla_sls-_slaor";
 
-/// UploadSignEntity 字段声明顺序（31 个）。
-pub const UPLOAD_SIGN_FIELD_ORDER: [&str; 31] = [
-    "sportType",
-    "totalTime",
-    "totalDis",
-    "speed",
-    "startTime",
-    "stopTime",
-    "complete",
-    "selDistance",
-    "unCompleteReason",
-    "getPrize",
-    "status",
-    "uuid",
-    "uid",
-    "avgStepFreq",
-    "totalSteps",
-    "selectedUnid",
-    "calorie",
-    "policy",
-    "selRunTime",
-    "validDis",
-    "validTime",
-    "useMobilityTools",
-    "errorCode",
-    "geeToken",
-    "unauthorized",
-    "themeId",
-    "faceCheck",
-    "goalId",
-    "address",
-    "avgPower",
-    "totalAscent",
-];
+/// iOS 7.4.0 签名排除集：buildGrade 对 body 副本 removeObjectsForKeys
+/// (@[allLocJson, fivePointJson]) 后签名。segmentJson/speedPerTenSec/
+/// stepsPerTenSec/signature 在签名之后才插入，天然不在输入里。
+pub const IOS_SIGN_EXCLUDED: [&str; 2] = ["allLocJson", "fivePointJson"];
 
-/// UploadSignEntity.OooO00o 反射语义：String 原值，其余 String.valueOf。
-fn android_value(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Null => "null".into(),
-        serde_json::Value::Bool(b) => if *b { "true".into() } else { "false".into() },
-        serde_json::Value::Number(n) => n.to_string(),
-        other => other.to_string(),
-    }
-}
-
-/// UploadSignEntity(entity) → OooO00o() 反射 Map + 可选 roomId。
-fn build_sign_map(values: &serde_json::Value, has_room_id: bool) -> Vec<(String, String)> {
-    let mut m = Vec::new();
-    for key in UPLOAD_SIGN_FIELD_ORDER {
-        if let Some(v) = values.get(key) {
-            m.push((key.to_string(), android_value(v)));
-        }
-    }
-    if has_room_id {
-        if let Some(v) = values.get("roomId") {
-            m.push(("roomId".to_string(), android_value(v)));
-        }
-    }
-    m
-}
-
-/// OooOO0：移除 key 忽略大小写等于 "signature" 的项。
-fn filter_signature(m: Vec<(String, String)>) -> Vec<(String, String)> {
-    m.into_iter()
-        .filter(|(k, _)| k.to_lowercase() != "signature")
-        .collect()
-}
-
-/// OooO00o（自然序）/ OooO0O0（compareToIgnoreCase）拼接。
-fn join_query(m: &[(String, String)], ignore_case: bool) -> String {
-    let mut items: Vec<&(String, String)> = m.iter().collect();
-    if ignore_case {
-        items.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
-    } else {
-        items.sort_by(|a, b| a.0.cmp(&b.0));
-    }
-    items
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("&")
-}
-
-/// OooO0Oo(map)：过滤后自然序拼接（无 MD5，无盐）。
-pub fn original_sign(values: &serde_json::Value, has_room_id: bool) -> String {
-    let m = filter_signature(build_sign_map(values, has_room_id));
-    join_query(&m, false)
-}
-
-/// OooO0oO(map)：过滤 → 忽略大小写排序拼接 → MD5(串 + 盐)。
-pub fn signature(values: &serde_json::Value, has_room_id: bool) -> String {
-    let m = filter_signature(build_sign_map(values, has_room_id));
-    let query = join_query(&m, true);
-    md5_hex(format!("{query}{}", SALT).as_bytes())
-}
-
-/// iOS 7.4.0 签名排除集：removeObjectsForKeys(@[allLocJson, fivePointJson]) 后再签，
-/// segmentJson/speedPerTenSec/stepsPerTenSec/signature/originalSign 在签名之后才插入。
-pub const IOS_SIGN_EXCLUDED: [&str; 7] = [
-    "allLocJson",
-    "fivePointJson",
-    "segmentJson",
-    "speedPerTenSec",
-    "stepsPerTenSec",
-    "signature",
-    "originalSign",
-];
-
-/// iOS 7.4.0 值语义（_queryStringWithSortedKeys:percentEncode:）：字符串原样、
-/// NSNull → ""、NSNumber description（Bool→"1"/"0"，整数十进制）。
+/// iOS 7.4.0 值语义（_queryStringWithSortedKeys:percentEncode:）：
+/// NSNull → ""、其余取 [obj description]（字符串原样，NSNumber Bool→"1"/"0"）。
 fn ios_value(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Null => String::new(),
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Bool(b) => if *b { "1".into() } else { "0".into() },
-        other => android_value(other),
+        other => other.to_string(),
     }
 }
 
-/// iOS 签名输入：body 全部键 − 排除集（非 Android 的 31 字段白名单）。
+/// iOS 签名输入：body 全部键 − 排除集。
 fn build_ios_sign_map(values: &serde_json::Value) -> Vec<(String, String)> {
     values
         .as_object()
@@ -141,15 +38,72 @@ fn build_ios_sign_map(values: &serde_json::Value) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// iOS 7.4.0 signature：sortedQueryStringWithoutEncoding（大小写敏感排序）+ MD5(串 + 盐)。
+/// iOS 7.4.0 sortedQueryStringWithoutEncoding：键按 lowercaseString compare
+/// （sortedArrayUsingComparator 块实证为先小写化再 compare）。
+fn join_query_ios(m: &[(String, String)]) -> String {
+    // 键按小写化后比较（IPA 的 sortedArrayUsingComparator 块）；先算一次小写键再排序，
+    // 避免每个比较对都重新分配字符串。
+    let mut items: Vec<(String, &(String, String))> = m
+        .iter()
+        .map(|kv| (kv.0.to_lowercase(), kv))
+        .collect();
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    items
+        .iter()
+        .map(|(_, (k, v))| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// iOS 7.4.0 signature：sortedQueryStringWithoutEncoding + MD5(串 + 盐)。
 pub fn signature_ios(values: &serde_json::Value) -> String {
-    let query = join_query(&build_ios_sign_map(values), false);
+    let query = join_query_ios(&build_ios_sign_map(values));
     md5_hex(format!("{query}{}", SALT).as_bytes())
 }
 
-/// iOS 7.4.0 originalSign：同一 sortedQueryStringWithoutEncoding 明文（无 MD5 无盐）。
+/// iOS 7.4.0 originalSign：同一 sortedQueryStringWithoutEncoding 明文。
 pub fn original_sign_ios(values: &serde_json::Value) -> String {
-    join_query(&build_ios_sign_map(values), false)
+    join_query_ios(&build_ios_sign_map(values))
+}
+
+/// 室内跑的签名：`+[SWEncryption signObject:suffix:]` —— 用**编码版** query。
+///
+/// 与室外不同：室外走 `signObjectWithoutEncoding:`（`percentEncode:NO`），
+/// 室内 `buildGrade` @0x1002011f0 走的是 `signObject:suffix:`，
+/// 即 `_queryStringWithSortedKeys:YES percentEncode:YES`。
+/// `URLQueryAllowedCharacterSet` 覆盖字母数字与 `-._~!$&'()*+,;=:@/?`，
+/// 因此数字/经纬度字符串不会被编码；只有中文、空格等才会变成 %XX（大写）。
+pub fn indoor_signature(values: &serde_json::Value, salt: &str) -> String {
+    let q = join_query_ios_encoded(&build_ios_sign_map(values));
+    md5_hex(format!("{q}{salt}").as_bytes())
+}
+
+/// 与 [`join_query_ios`] 相同，但按 `URLQueryAllowedCharacterSet` 做百分号编码。
+pub fn join_query_ios_encoded(m: &[(String, String)]) -> String {
+    let mut items: Vec<(String, &(String, String))> =
+        m.iter().map(|kv| (kv.0.to_lowercase(), kv)).collect();
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    items
+        .iter()
+        .map(|(_, (k, v))| format!("{}={}", percent_encode_url_query(k), percent_encode_url_query(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Foundation `URLQueryAllowedCharacterSet` 的近似：字母数字 + `-._~!$&'()*+,;=:@/?`
+/// 不编码，其余按 UTF-8 逐字节编码为大写 %XX。
+fn percent_encode_url_query(s: &str) -> String {
+    const EXTRA: &[u8] = b"-._~!$&'()*+,;=:@/?";
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        let keep = b.is_ascii_alphanumeric() || EXTRA.contains(b);
+        if keep {
+            out.push(*b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// 五点/点位请求的 sign：HTTP 版 URL + 固定 suffix 的 MD5（body 不参与）。
@@ -163,74 +117,89 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// iOS 7.4.0 签名语义：大小写敏感排序（unCompleteReason 在 unauthorized 前，
-    /// 因 'C'(0x43) < 'a'(0x61)）；Bool→"1"/"0"；Null→""。
+    /// iOS 7.4.0 签名语义（IPA 实证 sortedArrayUsingComparator 块）：
+    /// 键按 lowercaseString compare（忽略大小写）；Bool→"1"/"0"；Null→""。
     #[test]
     fn test_ios_signature_semantics() {
         let sample = json!({
             "sportType": 1, "totalTime": 1200, "totalDis": 2100, "speed": 43008,
             "startTime": 1700000000000i64, "stopTime": 1700000001200i64,
-            "complete": true, "selDistance": 2000, "unCompleteReason": 0,
-            "getPrize": false, "status": 0, "uuid": "TEST-UUID", "uid": 13056447,
+            "complete": "true", "selDistance": 2000, "unCompleteReason": 0,
+            "getPrize": "false", "status": 0, "uuid": "TEST-UUID", "uid": 13056447,
+            "sessionId": "436cb925-0840-8fd1-524f-7c43e44a8e73",
             "avgStepFreq": 165, "totalSteps": 3300, "selectedUnid": 57501,
             "calorie": 132, "policy": 0, "selRunTime": 1200, "validDis": 2050,
-            "validTime": 1180, "useMobilityTools": 0, "errorCode": 0,
-            "geeToken": "", "unauthorized": 0, "themeId": 0, "faceCheck": 1,
-            "goalId": null, "address": "大连市", "avgPower": 210, "totalAscent": 12,
+            "validTime": 1180, "useMobilityTools": 0, "faceCheck": 1,
         });
-        // originalSign 明文：验证键序（大小写敏感）与值语义
         let orig = original_sign_ios(&sample);
+        // 键序：小写化后有序（selectedUnid→selectedunid 在 selRunTime→selruntime 后）
         let keys: Vec<&str> = orig.split('&').map(|kv| kv.split('=').next().unwrap()).collect();
-        let _expect_order = [
-            "address", "avgPower", "avgStepFreq", "calorie", "complete", "errorCode",
-            "faceCheck", "geeToken", "getPrize", "goalId", "selDistance", "selRunTime",
-            "selectedUnid", "speed", "sportType", "startTime", "status", "stopTime",
-            "themeId", "totalAscent", "totalDis", "totalSteps", "totalTime", "uid",
-            "unCompleteReason", "unauthorized", "useMobilityTools", "uuid", "validDis",
-            "validTime",
-        ];
-        // 抽取排序后的键序必须整体有序（大小写敏感语义）
-        let mut sorted_keys = keys.clone();
-        sorted_keys.sort();
-        assert_eq!(keys, sorted_keys, "iOS 签名键必须大小写敏感有序");
-        // iOS 值语义：bool→1/0，null→空
-        assert!(orig.contains("complete=1"));
-        assert!(orig.contains("getPrize=0"));
-        assert!(orig.contains("goalId="));
+        let lower_keys: Vec<String> = keys.iter().map(|k| k.to_lowercase()).collect();
+        let sorted = {
+            let mut v = lower_keys.clone();
+            v.sort();
+            v
+        };
+        assert_eq!(lower_keys, sorted, "iOS 签名键必须小写化有序");
+        assert_eq!(
+            keys.iter().position(|k| *k == "selectedUnid").unwrap() + 1,
+            keys.iter().position(|k| *k == "selRunTime").unwrap(),
+            "小写比较：selruntime(selectedunid) 中 'l' < 'u'，selectedUnid 在 selRunTime 前"
+        );
+        // 排除集只有 allLocJson/fivePointJson
+        assert!(!orig.contains("fivePointJson"));
+        // sessionId 参与签名
+        assert!(orig.contains("sessionId=436cb925"));
         // signature = MD5(同串 + 盐)
         let sig = signature_ios(&sample);
-        assert_eq!(sig.len(), 32);
         assert_eq!(sig, md5_hex(format!("{orig}{SALT}").as_bytes()));
-        // 与 Android 形态（忽略大小写排序）在 unCompleteReason/unauthorized 对上必然不同
-        let android_orig = original_sign(&sample, false);
-        assert_ne!(
-            orig.split('&').position(|kv| kv.starts_with("unCompleteReason")),
-            android_orig.split('&').position(|kv| kv.starts_with("unauthorized")).map(|p| p.saturating_sub(0)),
-            "两种形态键序语义不同"
+
+        // 黄金向量：把上面那条"自洽"断言升级成字面量，防止实现与测试一起被改歪。
+        // 排序依据：`+[NSDictionary _queryStringWithSortedKeys:percentEncode:]` @0x1002bd900
+        // 用 `sortedArrayUsingComparator:`，其 comparator @0x1002bdba0 是
+        // `[a2.lowercaseString compare:a3.lowercaseString]` —— **忽略大小写**。
+        // 因此 `selectedUnid`（selectedunid）排在 `selRunTime`（selruntime）**之前**；
+        // 若哪天改成按原始键做字节序，这两者会互换，下面的字面量会立刻失败。
+        assert_eq!(
+            orig,
+            "avgStepFreq=165&calorie=132&complete=true&faceCheck=1&getPrize=false&policy=0\
+             &selDistance=2000&selectedUnid=57501&selRunTime=1200\
+             &sessionId=436cb925-0840-8fd1-524f-7c43e44a8e73&speed=43008&sportType=1\
+             &startTime=1700000000000&status=0&stopTime=1700000001200&totalDis=2100\
+             &totalSteps=3300&totalTime=1200&uid=13056447&unCompleteReason=0\
+             &useMobilityTools=0&uuid=TEST-UUID&validDis=2050&validTime=1180"
         );
+        assert_eq!(sig, "6f23fae3a0333f577e84dfd9202c2659");
     }
 
-    /// 实测向量（31 字段 + roomId 样例）。
+    /// iOS 签名语义：键按 lowercaseString 排序，signature = MD5(orig + 盐)。
     #[test]
-    fn test_signature_vectors() {
+    fn test_ios_signature_vectors() {
         let sample = json!({
-            "sportType": 3, "totalTime": 1000, "totalDis": 1200, "speed": 1200,
-            "startTime": 1700000000000i64, "stopTime": 1700000001000i64,
-            "complete": true, "selDistance": 1500, "unCompleteReason": 0,
-            "getPrize": false, "status": 1, "uuid": "test-uuid", "uid": 13056447,
-            "avgStepFreq": 134, "totalSteps": 1000, "selectedUnid": 57501,
-            "calorie": 0, "policy": 0, "selRunTime": 0, "validDis": 1100,
-            "validTime": 900, "useMobilityTools": 0, "errorCode": 0,
-            "geeToken": "", "unauthorized": 0, "themeId": 0, "faceCheck": 1,
-            "goalId": null, "address": "", "avgPower": 0, "totalAscent": 0,
-            "roomId": 1001
+            "sportType": 1, "totalTime": 540, "totalDis": 1200, "speed": 7500,
+            "startTime": 1_793_851_519_462i64, "stopTime": 1_793_852_059_462i64,
+            "complete": "true", "getPrize": "false", "status": 0,
+            "uuid": "TEST-UUID", "uid": 17837509, "unauthorized": "0",
+            "themeId": 0, "selectedUnid": 47203, "selRunTime": 300, "selDistance": 1000,
+            "validDis": 1200, "validTime": 540, "unCompleteReason": 0,
+            "useMobilityTools": 0, "calorie": 87, "address": "江门市", "goalId": 0,
+            "totalAscent": 5, "avgPower": 166, "totalSteps": 1200,
+            "avgStepFreq": 133, "faceCheck": 1, "policy": 1,
         });
-        assert_eq!(signature(&sample, true), "f2b958b2b9c8e99c4156076fbc72aabe");
-        assert_eq!(signature(&sample, false), "6187185669bbd60d0c9ff4148f33e16d");
-        let orig = original_sign(&sample, true);
-        assert!(orig.starts_with("address=&avgPower=0&avgStepFreq=134&calorie=0&complete=true&errorCode=0&faceChec"));
-        // goalId=null → "null"
-        assert!(orig.contains("goalId=null"));
+        let orig = original_sign_ios(&sample);
+        // 键序必须是小写化有序
+        let keys: Vec<String> = orig.split('&')
+            .map(|kv| kv.split('=').next().unwrap().to_lowercase()).collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "iOS 签名键必须小写化有序");
+        // 字符串型字段与数字型字段按各自 description 输出
+        assert!(orig.contains("complete=true"));
+        assert!(orig.contains("getPrize=false"));
+        assert!(orig.contains("unauthorized=0"));
+        assert!(orig.contains("speed=7500"));
+        // signature = MD5(orig + 盐)
+        assert_eq!(signature_ios(&sample), md5_hex(format!("{orig}{SALT}").as_bytes()));
     }
 
     /// URL sign 向量。

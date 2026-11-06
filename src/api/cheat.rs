@@ -35,12 +35,14 @@ impl CheatReport {
 }
 
 pub fn query(client: &mut ApiClient, page: i64, log: &mut dyn FnMut(&str)) -> Result<CheatReport, String> {
-    let unid: i64 = client
+    // IPA 里 unid 取自 `getUNID`，是 **NSString**，不能发数字。
+    let unid = client
         .login
         .as_ref()
-        .map(|s| s.unid.parse().unwrap_or(0))
-        .unwrap_or(0);
+        .map(|s| s.unid.clone())
+        .unwrap_or_default();
     // 7.4.0 实机：pageSize 固定 50
+    let page = page.max(1);
     let body = json!({ "pageNum": page, "pageSize": 50, "unid": unid }).to_string();
     let biz = client.call_host(DISCOVERY, "POST", CHEATLIST_PATH, &body, &[])?;
     let data = super::client::parse_data_field(&biz);

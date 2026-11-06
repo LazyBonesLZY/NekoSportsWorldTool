@@ -1,16 +1,9 @@
-//! 设备信息页：iOS/Android 单选 + 6 字段 + 整套随机 + 持久化。
+//! 设备信息页：iPhone 身份 6 字段 + 整套随机 + 持久化（只模拟 iOS）。
 //! ⚠ 设备 ID 固定复用（防 10121 风控）；随机后必须手动「保存」才生效。
 
 use super::{mobile, theme, App};
 use crate::crypto::header::HeaderIdentity;
 use eframe::egui;
-
-const IOS_OS_POOL: [&str; 7] = ["17.5.1", "18.0.1", "18.1", "18.2", "18.3.1", "18.5", "26.5.2"];
-const ANDROID_MODEL_POOL: [&str; 8] = [
-    "22081212C", "OPPO PGBM10", "Redmi K60", "HUAWEI Mate 40", "vivo V2309A",
-    "Pixel 8", "SM-S9210", "OnePlus ACE3",
-];
-const ANDROID_OS_POOL: [&str; 4] = ["12", "13", "14", "15"];
 
 #[derive(Default)]
 pub struct DevicePage {
@@ -18,42 +11,6 @@ pub struct DevicePage {
 }
 
 impl App {
-    #[cfg(target_os = "android")]
-    pub(super) fn poll_device_info(&mut self) {
-        let Some(reply) = crate::android::take_device_info() else { return };
-        let info = match reply.result {
-            Ok(Some(info)) => info,
-            Ok(None) => {
-                self.status = "未读取本机信息，可在设备信息页手动填写或再次读取".into();
-                return;
-            }
-            Err(error) => { self.status = format!("× {error}"); return; }
-        };
-        let identity = if reply.initial { &self.identity } else { &self.device_buf };
-        match crate::api::model::identity_with_device_info(identity, &info) {
-            Ok(updated) => {
-                self.device_buf = updated;
-                if reply.initial {
-                    match crate::api::model::save_identity(&self.device_buf) {
-                        Ok(()) => {
-                            self.identity = self.device_buf.clone();
-                            crate::android::complete_device_info();
-                            self.status = format!("已读取 {} {} / Android {}；UUID 保持不变",
-                                info.manufacturer, info.model, info.os_version);
-                        }
-                        Err(error) => {
-                            self.tab = 5;
-                            self.status = format!("× 保存失败：{error}，请在设备页重新保存");
-                        }
-                    }
-                } else {
-                    self.status = format!("已读取 {} {}；点击保存后生效，UUID 保持不变", info.manufacturer, info.model);
-                }
-            }
-            Err(error) => self.status = format!("× {error}"),
-        }
-    }
-
     pub fn draw_device(&mut self, ui: &mut egui::Ui) {
         let mut page = std::mem::take(&mut self.device_page);
         egui::ScrollArea::vertical()
@@ -65,27 +22,38 @@ impl App {
     fn draw_device_inner(&mut self, ui: &mut egui::Ui, page: &mut DevicePage) {
         ui.add_space(6.0);
 
-        mobile::row(ui, |ui| {
-            ui.radio_value(&mut self.device_buf.platform, "ios".to_string(), "iOS");
-            ui.radio_value(&mut self.device_buf.platform, "android".to_string(), "Android");
+        // 身份文件损坏：这里必须能自助修复，否则整个工具都不可用。
+        if let Some(err) = self.identity_error.clone() {
+            ui.colored_label(theme::err(), format!("× 设备身份读取失败：{err}"));
+            ui.colored_label(
+                theme::warn(),
+                "原文件会改名保留（identity.json.corrupt-<时间戳>），随后重新生成 DeviceId/IDFA。",
+            );
+            mobile::row(ui, |ui| {
+                if ui
+                    .add_enabled(
+                        !self.busy(super::JobKind::Login),
+                        theme::primary_btn("备份并重建身份"),
+                    )
+                    .clicked()
+                {
+                    self.rebuild_identity();
+                }
+            });
             ui.separator();
-            let platform = self.device_buf.platform.clone();
+        }
+
+        mobile::row(ui, |ui| {
             if ui.button("随机生成").clicked() {
-                randomize(&mut self.device_buf, &platform);
-                self.status = "已生成随机设备（未保存——手动保存后才生效）".into();
+                randomize(&mut self.device_buf);
+                self.status = "已生成随机 iPhone（未保存——手动保存后才生效）".into();
             }
         });
 
-        #[cfg(target_os = "android")]
-        if ui.button("读取本机信息").clicked() {
-            crate::android::request_device_info(false);
-        }
-
         ui.add_space(6.0);
-        let is_ios = self.device_buf.platform != "android";
-        let id_label = if is_ios { "DeviceId（UUID 大写）" } else { "DeviceId（Android）" };
-        let idfa_label = if is_ios { "IDFA（可空）" } else { "IMEI（可空）" };
-        let name_label = if is_ios { "设备名" } else { "机型" };
+        let id_label = "DeviceId（UUID 大写）";
+        let idfa_label = "IDFA（可空；留空则按 DeviceId 派生并随保存落盘）";
+        let name_label = "设备名";
         if mobile::compact_ui(ui) {
             ui.vertical(|ui| {
                 ui.label(id_label);
@@ -96,10 +64,6 @@ impl App {
                 mobile::text_edit(ui, "device_os", &mut self.device_buf.os_version, crate::platform::InputKind::Text, ui.available_width());
                 ui.label(name_label);
                 mobile::text_edit(ui, "device_name", &mut self.device_buf.device_name, crate::platform::InputKind::Text, ui.available_width());
-                if !is_ios {
-                    ui.label("品牌（本地展示，可空）：");
-                    mobile::text_edit(ui, "device_manufacturer", &mut self.device_buf.manufacturer, crate::platform::InputKind::Text, ui.available_width());
-                }
                 ui.label("城市：");
                 mobile::text_edit(ui, "device_city", &mut self.device_buf.city, crate::platform::InputKind::Text, ui.available_width());
                 ui.label("定位锚点纬度：");
@@ -124,11 +88,6 @@ impl App {
                     ui.label(name_label);
                     mobile::text_edit(ui, "device_name", &mut self.device_buf.device_name, crate::platform::InputKind::Text, 200.0);
                     ui.end_row();
-                    if !is_ios {
-                        ui.label("品牌（本地展示，可空）：");
-                        mobile::text_edit(ui, "device_manufacturer", &mut self.device_buf.manufacturer, crate::platform::InputKind::Text, 200.0);
-                        ui.end_row();
-                    }
                     ui.label("城市：");
                     mobile::text_edit(ui, "device_city", &mut self.device_buf.city, crate::platform::InputKind::Text, 120.0);
                     ui.end_row();
@@ -142,6 +101,14 @@ impl App {
         }
 
         ui.add_space(4.0);
+        // 分辨率随机型走：用户改不了，但要看得到，否则「保存后分辨率自己变了」无从解释。
+        ui.colored_label(
+            theme::text_dim(),
+            format!(
+                "分辨率（随设备名自动校正，只读）：逻辑 {} / 物理 {}",
+                self.device_buf.logic_pixel, self.device_buf.physic_pixel
+            ),
+        );
         ui.colored_label(
             theme::text_dim(),
             "定位锚点填写顺序：先填纬度，再填经度；地图常见的“经度,纬度”格式需要调换后填写。",
@@ -160,11 +127,28 @@ impl App {
         ui.add_space(8.0);
         mobile::row(ui, |ui| {
             if ui.add(theme::primary_btn("保存")).clicked() {
+                // 机型命中真机池时按池内权威分辨率纠正：手改设备名后像素不会停在旧值上。
+                let pixels_fixed = self.device_buf.normalize_pixels_to_model();
+                // 留空的 IDFA 在保存时立即派生并落盘，而不是等下次启动再随机一个。
+                if self.device_buf.idfa.trim().is_empty() {
+                    let derived = self.device_buf.effective_idfa();
+                    self.device_buf.idfa = derived;
+                }
                 match crate::api::model::save_identity(&self.device_buf) {
                     Ok(()) => {
                         self.identity = self.device_buf.clone();
                         self.status = "√ 设备身份已保存并生效".into();
                         self.log.push("√  已更新（新设备 ID 从下个请求开始生效）");
+                        if pixels_fixed {
+                            self.log.push(&format!(
+                                "√  已按机型「{}」纠正分辨率为 {} / {}",
+                                self.identity.device_name,
+                                self.identity.logic_pixel,
+                                self.identity.physic_pixel
+                            ));
+                        }
+                        // 锚点/城市可能已换：让跑步页的路线预览失效，下次进入按新锚点重算。
+                        self.run_page.preview_stale = true;
                         page.saved_flash = 2.0;
                     }
                     Err(e) => self.status = format!("× 保存失败：{e}"),
@@ -191,7 +175,7 @@ impl App {
         ui.add_space(4.0);
         ui.label(format!(
             "当前生效身份：{} / {} / {} / 城市 {} / 锚点({:.6},{:.6})",
-            if self.identity.platform == "android" { "Android" } else { "iOS" },
+            "iOS",
             self.identity.device_name,
             self.identity.os_version,
             self.identity.city,
@@ -207,9 +191,6 @@ impl App {
         if page.saved_flash > 0.0 {
             page.saved_flash -= ui.ctx().input(|i| i.stable_dt);
         }
-        if self.identity.platform == "android" && !self.identity.manufacturer.is_empty() {
-            ui.label(format!("当前保存品牌：{}", self.identity.manufacturer));
-        }
     }
 }
 
@@ -219,32 +200,28 @@ fn location_fields_changed(saved: &HeaderIdentity, pending: &HeaderIdentity) -> 
         || (saved.anchor_lon - pending.anchor_lon).abs() > 1e-9
 }
 
-/// 整套随机：uuid v4 设备 ID（大写）；机型/系统按平台池抽取。
-fn randomize(buf: &mut HeaderIdentity, platform: &str) {
+/// 整套随机：uuid v4 设备 ID（大写）；先抽机型，再抽该机型的系统版本。
+///
+/// 机型与系统必须相关：独立抽样会产出「iPhone 17 Pro + iOS 18.1」这类出厂就不存在的
+/// 组合，正是机型/系统交叉校验最容易识别的指纹。
+fn randomize(buf: &mut HeaderIdentity) {
     buf.manufacturer.clear();
+    buf.platform = "ios".into();
     buf.device_id = uuid::Uuid::new_v4().to_string().to_uppercase();
-    buf.app_install_time = HeaderIdentity::fresh_install_time(platform);
-    if platform == "android" {
-        let i = (rand::random::<f64>() * ANDROID_MODEL_POOL.len() as f64) as usize
-            % ANDROID_MODEL_POOL.len();
-        let j =
-            (rand::random::<f64>() * ANDROID_OS_POOL.len() as f64) as usize % ANDROID_OS_POOL.len();
-        buf.device_name = ANDROID_MODEL_POOL[i].into();
-        buf.os_version = ANDROID_OS_POOL[j].into();
-        buf.idfa = String::new();
-        buf.platform = "android".into();
-    } else {
-        let k = (rand::random::<f64>() * IOS_OS_POOL.len() as f64) as usize % IOS_OS_POOL.len();
-        // 整套抽取真机档位：营销名 + 逻辑/物理分辨率（全部 3x，与 UA Scale/3.00 一致）
-        let pool = &crate::crypto::header::IOS_DEVICE_POOL;
-        let p = pool[(rand::random::<f64>() * pool.len() as f64) as usize % pool.len()];
-        buf.device_name = p.0.into();
-        buf.os_version = IOS_OS_POOL[k].into();
-        buf.logic_pixel = p.1.into();
-        buf.physic_pixel = p.2.into();
-        buf.idfa = uuid::Uuid::new_v4().to_string().to_uppercase();
-        buf.platform = "ios".into();
+    buf.app_install_time = HeaderIdentity::fresh_install_time();
+    // 整套抽取真机档位：营销名 + 逻辑/物理分辨率（全部 3x，与 UA Scale/3.00 一致）
+    let pool = &crate::crypto::header::IOS_DEVICE_POOL;
+    let p = pool[(rand::random::<f64>() * pool.len() as f64) as usize % pool.len()];
+    buf.device_name = p.0.into();
+    buf.logic_pixel = p.1.into();
+    buf.physic_pixel = p.2.into();
+    let os_pool = crate::crypto::header::os_pool_for_model(&buf.device_name);
+    if !os_pool.is_empty() {
+        let k = (rand::random::<f64>() * os_pool.len() as f64) as usize % os_pool.len();
+        buf.os_version = os_pool[k].into();
     }
+    // iOS WHSimulateIDFA：随机 UUID 一经生成即复用
+    buf.idfa = uuid::Uuid::new_v4().to_string().to_uppercase();
 }
 
 #[cfg(test)]
@@ -267,13 +244,52 @@ mod tests {
 
     #[test]
     fn random_device_does_not_keep_a_previously_imported_brand() {
-        for platform in ["android", "ios"] {
-            let mut identity = HeaderIdentity {
-                manufacturer: "Previously imported brand".into(),
-                ..Default::default()
-            };
-            randomize(&mut identity, platform);
-            assert!(identity.manufacturer.is_empty(), "random {platform} identity must not retain a different device's brand");
+        let mut identity = HeaderIdentity {
+            manufacturer: "Previously imported brand".into(),
+            ..Default::default()
+        };
+        randomize(&mut identity);
+        assert!(
+            identity.manufacturer.is_empty(),
+            "random identity must not retain a different device's brand"
+        );
+    }
+
+    /// 机型与系统必须来自同一档位：iPhone 17/Air 只允许 iOS 26 系。
+    #[test]
+    fn random_device_pairs_model_with_its_own_system_pool() {
+        for _ in 0..64 {
+            let mut identity = HeaderIdentity::default();
+            randomize(&mut identity);
+            let pool = crate::crypto::header::os_pool_for_model(&identity.device_name);
+            assert!(
+                pool.contains(&identity.os_version.as_str()),
+                "{} 与 iOS {} 不是同一档位",
+                identity.device_name,
+                identity.os_version
+            );
+            let pixels = crate::crypto::header::pixels_for_model(&identity.device_name)
+                .expect("random model must come from the device pool");
+            assert_eq!(identity.logic_pixel, pixels.0);
+            assert_eq!(identity.physic_pixel, pixels.1);
+            assert_eq!(identity.platform, "ios");
         }
+    }
+
+    /// 留空 IDFA 在保存路径上必须回填派生值，而不是保持空串。
+    #[test]
+    fn empty_idfa_is_backfilled_with_the_derived_value() {
+        let mut identity = HeaderIdentity {
+            device_id: "66147D92-F160-4A5E-937B-B8B36FCEE21F".into(),
+            idfa: String::new(),
+            ..Default::default()
+        };
+        let derived = identity.effective_idfa();
+        if identity.idfa.trim().is_empty() {
+            identity.idfa = derived.clone();
+        }
+        assert!(!identity.idfa.is_empty());
+        assert_eq!(identity.idfa, derived);
+        assert_eq!(identity.effective_idfa(), derived, "回填后派生值必须不变");
     }
 }

@@ -31,23 +31,23 @@ impl App {
             match self.records_page.sub {
                 0 => {
                     if ui
-                        .add_enabled(!self.records_busy, theme::primary_btn("刷新"))
+                        .add_enabled(!self.records_busy(), theme::primary_btn("刷新"))
                         .clicked()
                     {
                         self.refresh_records();
                     }
-                    if self.records_busy {
+                    if self.records_busy() {
                         ui.label("拉取中…");
                     }
                 }
                 _ => {
                     if ui
-                        .add_enabled(!self.records_busy, theme::primary_btn("刷新全部记录"))
+                        .add_enabled(!self.records_busy(), theme::primary_btn("刷新全部记录"))
                         .clicked()
                     {
                         self.refresh_ai_records();
                     }
-                    if self.records_busy {
+                    if self.records_busy() {
                         ui.label("拉取中…");
                     }
                 }

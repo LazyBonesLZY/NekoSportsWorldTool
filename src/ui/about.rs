@@ -27,7 +27,8 @@ pub struct UpdateUi {
 
 #[derive(Clone)]
 pub enum FinishAction {
-    /// 桌面：替换完成，等待重启。
+    /// 桌面：替换完成，等待重启（Android 构建下不会构造）。
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     Restart { tag: String },
     /// Android：APK 已就绪，等待调起安装器（桌面构建下不会构造）。
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
@@ -243,11 +244,21 @@ impl App {
 
         if let Some(fin) = self.update.finish.clone() {
             let mut done = false;
+            let can_relaunch = crate::relaunch::available();
             let (title, body, button) = match fin {
                 FinishAction::Restart { tag } => (
                     format!("已更新到 {tag}"),
-                    "程序已替换完成，重启后使用新版本。".to_string(),
-                    "重启程序".to_string(),
+                    if can_relaunch {
+                        "程序已替换完成，重启后使用新版本。".to_string()
+                    } else {
+                        "程序已替换完成；当前版本不支持自动重启，请退出后手动重新打开。"
+                            .to_string()
+                    },
+                    if can_relaunch {
+                        "重启程序".to_string()
+                    } else {
+                        "退出程序".to_string()
+                    },
                 ),
                 FinishAction::InstallApk { tag } => (
                     format!("已下载 {tag}"),
@@ -276,6 +287,12 @@ impl App {
             if done {
                 match self.update.finish.take() {
                     Some(FinishAction::Restart { .. }) => {
+                        if !can_relaunch {
+                            // 占位实现下不假装能重启：直接退出，由用户手动打开新版本。
+                            self.status = "请手动重新打开程序以使用新版本".into();
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            return;
+                        }
                         match crate::relaunch::relaunch_self() {
                             Ok(()) => {
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
